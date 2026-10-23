@@ -32,11 +32,13 @@ type Recorder struct {
 
 type contextKey struct{}
 type callKey struct{}
+type effectiveTimeKey struct{}
 type Span struct {
 	recorder         *Recorder
 	function         string
 	input            any
 	started          time.Time
+	effectiveAt      string
 	callID, parentID uint64
 	once             sync.Once
 }
@@ -73,16 +75,25 @@ func FromContext(ctx context.Context) *Recorder {
 	return r
 }
 
+// WithEffectiveTime attaches the business/event time at which an operation's
+// input became effective. It is distinct from the system time and duration.
+func WithEffectiveTime(ctx context.Context, effectiveAt time.Time) context.Context {
+	if effectiveAt.IsZero() {
+		return ctx
+	}
+	return context.WithValue(ctx, effectiveTimeKey{}, effectiveAt.UTC().Format(time.RFC3339Nano))
+}
+
 // Start writes a START record and returns a child context carrying its call ID.
 func Start(ctx context.Context, function string, input any) (context.Context, *Span) {
 	r := FromContext(ctx)
+	effectiveAt, _ := ctx.Value(effectiveTimeKey{}).(string)
 	if r == nil {
-		return ctx, &Span{function: function, input: input, started: time.Now()}
+		return ctx, &Span{function: function, input: input, started: time.Now(), effectiveAt: effectiveAt}
 	}
 	parent, _ := ctx.Value(callKey{}).(uint64)
 	id := r.callSeq.Add(1)
-	s := &Span{recorder: r, function: function, input: input, started: time.Now(), callID: id, parentID: parent}
-	_ = r.write("START", function, input, nil, nil, 0, nil, id, parent)
+	s := &Span{recorder: r, function: function, input: input, started: time.Now(), effectiveAt: effectiveAt, callID: id, parentID: parent}
 	return context.WithValue(ctx, callKey{}, id), s
 }
 func (s *Span) End(output any, tokens *int, err error) {
@@ -91,7 +102,7 @@ func (s *Span) End(output any, tokens *int, err error) {
 	}
 	s.once.Do(func() {
 		if s.recorder != nil {
-			_ = s.recorder.write("END", s.function, s.input, output, tokens, time.Since(s.started), err, s.callID, s.parentID)
+			_ = s.recorder.write("END", s.function, s.input, output, tokens, time.Since(s.started), err, s.callID, s.parentID, s.effectiveAt)
 		}
 	})
 }
@@ -146,9 +157,9 @@ func safeJSON(v any) string {
 	return string(clean)
 }
 func (r *Recorder) Record(function string, input, output any, tokens *int, elapsed time.Duration, err error) error {
-	return r.write("END", function, input, output, tokens, elapsed, err, r.callSeq.Add(1), 0)
+	return r.write("END", function, input, output, tokens, elapsed, err, r.callSeq.Add(1), 0, "")
 }
-func (r *Recorder) write(phase, function string, input, output any, tokens *int, elapsed time.Duration, err error, callID, parentID uint64) error {
+func (r *Recorder) write(phase, function string, input, output any, tokens *int, elapsed time.Duration, err error, callID, parentID uint64, effectiveAt string) error {
 	if r == nil {
 		return nil
 	}
@@ -158,13 +169,16 @@ func (r *Recorder) write(phase, function string, input, output any, tokens *int,
 	if tokens != nil {
 		tokenText = fmt.Sprint(*tokens)
 	}
+	if effectiveAt == "" {
+		effectiveAt = "?"
+	}
 	result := output
 	if err != nil {
 		result = map[string]any{"error": err.Error()}
 	}
 	r.seq++
 	now := time.Now().Format(time.RFC3339Nano)
-	body := fmt.Sprintf("agent:%s, func:%s(input:%s), return:%s, token:%s, response_time:%s, time:%s, session:%s, seq:%d, call_id:%d, parent_call_id:%d, phase:%s, prev_hash:%s", r.AgentName, function, safeJSON(input), safeJSON(result), tokenText, elapsed.Round(time.Millisecond), now, r.SessionID, r.seq, callID, parentID, phase, r.lastHash)
+	body := fmt.Sprintf("agent:%s, func:%s(input:%s), return:%s, token:%s, response_time:%s, time:%s, effective_time:%s, session:%s, seq:%d, call_id:%d, parent_call_id:%d, phase:%s, prev_hash:%s", r.AgentName, function, safeJSON(input), safeJSON(result), tokenText, elapsed.Round(time.Millisecond), now, effectiveAt, r.SessionID, r.seq, callID, parentID, phase, r.lastHash)
 	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(body)))
 	r.lastHash = hash
 	if _, e := r.file.WriteString("[DEBUG] " + body + ", hash:" + hash + "\n"); e != nil {

@@ -24,7 +24,7 @@ The `.env` file is ignored by Git. The CLI does not print API keys or upstream e
 - `graph`: named nodes, fixed and conditional edges, bounded loops, per-node patch commit, execution trace, checkpoint storage interface.
 - `model`: six HTTP protocols, explicit reasoning wire modes, token estimate based router with failover.
 - `agent`: composable template with `Ask`, `Chat`, `GetInformation`, `Triage`, `RunTool`, hooks, Markdown and GSD card retrieval.
-- `agentlog`: one audit session shared by every framework function in the call tree, with paired start/end events, parent relationships, token usage, timing, redaction, and a verifiable hash chain.
+- `agentlog`: one audit session shared by every framework function in the call tree, with one completion record per invocation, parent relationships, token usage, timing, redaction, and a verifiable hash chain.
 - `gsd`: legacy JSONL reader, rule baseline, evaluator. Truth is read only by `benchmark` and `evaluate`; retrieval indexes knowledge cards and source claims only.
 
 Go uses interfaces and embedding for polymorphism. Extend `agent.Template` through embedding, inject a `model.Client`, `agent.Retriever`, or `agent.Tool`, and use `graph.New()` to define domain-specific workflows. Tool execution is explicitly registered by the host application.
@@ -44,13 +44,15 @@ defer equipmentAgent.Close()
 
 `Ask` appends its evidence and citation contract to this prompt. `Chat` sends the configured prompt directly before caller messages. `BuildMessages` is public for derived agent types that need to inspect or extend prompt construction. The effective prompt and final provider messages are included in the audit log.
 
-`agent.Template` and every CLI command create one `log/{agentName}_{YYYY-MM-DD-HH-MM-SS.nanoseconds}.log` audit session. The same recorder follows `context.Context` through the template, hooks, graph construction and execution, every node and conditional router, checkpoint operation, RAG retrieval and tokenization, provider router, HTTP payload/response parsing, GSD matching/decisions/evaluation, and registered tool boundary. Each function writes paired records:
+`agent.Template` and every CLI command create one `log/{agentName}_{YYYY-MM-DD-HH-MM-SS.nanoseconds}.log` audit session. The same recorder follows `context.Context` through the template, hooks, graph construction and execution, every node and conditional router, checkpoint operation, RAG retrieval and tokenization, provider router, HTTP payload/response parsing, GSD matching/decisions/evaluation, and registered tool boundary. Each completed function invocation writes one record; `call_id` and `parent_call_id` retain nesting without duplicate START/END lines:
 
 ```text
 [DEBUG] agent:gsd-agent, func:model.HTTPClient.Chat(input:{...}), return:{...}, token:210, response_time:526ms, time:..., session:..., seq:42, call_id:9, parent_call_id:3, phase:END, prev_hash:..., hash:...
 ```
 
 Every record is flushed to disk. `seq` provides total ordering, call IDs reconstruct nesting, and the SHA-256 chain detects modification, reordering, and deletion inside the retained file. An external signed final hash is still needed to prove that the tail was not truncated. Verify a file with:
+
+Completion-only logging avoids serializing the same large state twice. A process terminated inside an unfinished function has no completion record; production crash evidence should also come from the process supervisor/runtime log.
 
 ```powershell
 go run ./cmd/agentctl audit-verify -log log/gsd-agent_2026-10-23-16-28-13.000000000.log

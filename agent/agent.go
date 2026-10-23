@@ -38,15 +38,18 @@ type Template struct {
 	Name string
 	// SystemPrompt is prepended to Ask and Chat model messages.
 	SystemPrompt string
-	LogDir       string
-	Logger       *agentlog.Recorder
-	logMu        sync.Mutex
-	Model        model.Client
-	Retriever    Retriever
-	Tools        map[string]Tool
-	Knowledge    *gsd.Knowledge
-	Before       func(context.Context, graph.State) error
-	After        func(context.Context, graph.Result) error
+	// MaxOutputTokens is forwarded to provider requests. Zero uses the model
+	// client's default, preserving backward compatibility.
+	MaxOutputTokens int
+	LogDir          string
+	Logger          *agentlog.Recorder
+	logMu           sync.Mutex
+	Model           model.Client
+	Retriever       Retriever
+	Tools           map[string]Tool
+	Knowledge       *gsd.Knowledge
+	Before          func(context.Context, graph.State) error
+	After           func(context.Context, graph.Result) error
 }
 
 // BuildMessages applies the agent-level system prompt and an optional operation instruction.
@@ -130,7 +133,7 @@ func (a *Template) Ask(ctx context.Context, q string, reasoning string) (result 
 			fmt.Fprintf(&b, "[%s] %s\n", d.ID, d.Text)
 		}
 		instruction := "Answer using the retrieved evidence. Cite document IDs. If evidence is insufficient, say so.\n" + b.String()
-		resp, err := a.Model.Chat(ctx, model.Request{Messages: a.BuildMessages(ctx, []model.Message{{Role: "user", Content: q}}, instruction), Reasoning: reasoning})
+		resp, err := a.Model.Chat(ctx, model.Request{Messages: a.BuildMessages(ctx, []model.Message{{Role: "user", Content: q}}, instruction), Reasoning: reasoning, MaxOutputTokens: a.MaxOutputTokens})
 		if err != nil {
 			return nil, err
 		}
@@ -186,7 +189,7 @@ func (a *Template) Chat(ctx context.Context, messages []model.Message, reasoning
 	if a.Model == nil {
 		return model.Response{}, errors.New("model not configured")
 	}
-	return a.Model.Chat(ctx, model.Request{Messages: a.BuildMessages(ctx, messages, ""), Reasoning: reasoning})
+	return a.Model.Chat(ctx, model.Request{Messages: a.BuildMessages(ctx, messages, ""), Reasoning: reasoning, MaxOutputTokens: a.MaxOutputTokens})
 }
 func (a *Template) RunTool(ctx context.Context, name string, input json.RawMessage) (output any, err error) {
 	ctx, e := a.auditContext(ctx)

@@ -55,7 +55,7 @@ func TestAutomaticLogger(t *testing.T) {
 		t.Fatal(err)
 	}
 	line := string(b)
-	for _, want := range []string{"[DEBUG] agent:etch-agent", "phase:START", "phase:END", "func:agent.Template.Chat(input:", "return:", "token:3", "response_time:", "time:", "prev_hash:", "hash:"} {
+	for _, want := range []string{"[DEBUG] agent:etch-agent", "phase:END", "func:agent.Template.Chat(input:", "return:", "token:3", "response_time:", "time:", "prev_hash:", "hash:"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("missing %s in %s", want, line)
 		}

@@ -49,17 +49,42 @@ func TestNestedCallAndChain(t *testing.T) {
 	}
 	r.Close()
 	records, err := Verify(r.Path)
-	if err != nil || records != 4 {
+	if err != nil || records != 2 {
 		t.Fatalf("records=%d err=%v", records, err)
 	}
 	b, _ := os.ReadFile(r.Path)
 	found := false
 	for _, line := range strings.Split(string(b), "\n") {
-		if strings.Contains(line, "func:inner(") && strings.Contains(line, "parent_call_id:1") && strings.Contains(line, "phase:START") {
+		if strings.Contains(line, "func:inner(") && strings.Contains(line, "parent_call_id:1") && strings.Contains(line, "phase:END") {
 			found = true
 		}
 	}
 	if !found {
 		t.Fatal("missing parent relationship")
+	}
+}
+
+func TestEffectiveTimeIsWrittenAndVerified(t *testing.T) {
+	r, err := New("effective", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	effective := time.Date(2026, 10, 23, 1, 2, 3, 0, time.UTC)
+	ctx := WithEffectiveTime(WithRecorder(context.Background(), r), effective)
+	_, span := Start(ctx, "test.operation", map[string]any{"value": 1})
+	span.End(map[string]any{"ok": true}, nil, nil)
+	path := r.Path
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "effective_time:2026-10-23T01:02:03Z") {
+		t.Fatalf("missing effective time: %s", b)
+	}
+	if _, err := Verify(path); err != nil {
+		t.Fatal(err)
 	}
 }

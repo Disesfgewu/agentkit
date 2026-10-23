@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -39,18 +41,22 @@ type Client interface {
 
 // ReasoningMode is a declared wire capability, not an inferred model property.
 type Config struct {
-	Name          string `json:"name"`
-	Protocol      string `json:"protocol"`
-	BaseURL       string `json:"base_url"`
-	Model         string `json:"model"`
-	APIKeyEnv     string `json:"api_key_env,omitempty"`
-	ReasoningMode string `json:"reasoning_mode,omitempty"`
-	ContextTokens int    `json:"context_tokens,omitempty"`
-	Tier          int    `json:"tier,omitempty"`
+	Name              string `json:"name"`
+	Protocol          string `json:"protocol"`
+	BaseURL           string `json:"base_url"`
+	Model             string `json:"model"`
+	APIKeyEnv         string `json:"api_key_env,omitempty"`
+	ReasoningMode     string `json:"reasoning_mode,omitempty"`
+	ContextTokens     int    `json:"context_tokens,omitempty"`
+	Tier              int    `json:"tier,omitempty"`
+	MaxRetries        int    `json:"max_retries,omitempty"`
+	RequestsPerMinute int    `json:"requests_per_minute,omitempty"`
 }
 type HTTPClient struct {
-	Config Config
-	HTTP   *http.Client
+	Config      Config
+	HTTP        *http.Client
+	rateMu      sync.Mutex
+	lastRequest time.Time
 }
 
 func New(c Config) (*HTTPClient, error) {
@@ -98,9 +104,76 @@ func (c *HTTPClient) Chat(ctx context.Context, r Request) (response Response, er
 	}
 	u := strings.TrimRight(c.Config.BaseURL, "/") + path
 	b, _ := json.Marshal(body)
-	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(b))
+	client := c.HTTP
+	if client == nil {
+		client = &http.Client{Timeout: 60 * time.Second}
+	}
+	maxRetries := c.Config.MaxRetries
+	if maxRetries == 0 {
+		maxRetries = 5
+	}
+	for attempt := 0; ; attempt++ {
+		if err := c.awaitRate(ctx); err != nil {
+			return Response{}, err
+		}
+		raw, status, retryAfter, requestErr := c.doRequest(ctx, client, u, b, headers, key, attempt)
+		if requestErr == nil && status < 300 {
+			return c.parse(ctx, raw)
+		}
+		retryable := status == http.StatusTooManyRequests || status == 500 || status == 502 || status == 503 || status == 504
+		if !retryable || attempt >= maxRetries {
+			if requestErr != nil {
+				return Response{}, requestErr
+			}
+			return Response{}, fmt.Errorf("%s HTTP %d after %d retries (body withheld)", c.Config.Name, status, attempt)
+		}
+		delay := time.Second << attempt
+		if retryAfter > delay {
+			delay = retryAfter
+		}
+		if delay > time.Minute {
+			delay = time.Minute
+		}
+		select {
+		case <-ctx.Done():
+			return Response{}, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+}
+
+func (c *HTTPClient) awaitRate(ctx context.Context) error {
+	if c.Config.RequestsPerMinute <= 0 {
+		return nil
+	}
+	interval := time.Minute / time.Duration(c.Config.RequestsPerMinute)
+	c.rateMu.Lock()
+	wait := time.Until(c.lastRequest.Add(interval))
+	if wait < 0 {
+		wait = 0
+	}
+	c.rateMu.Unlock()
+	if wait > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+	c.rateMu.Lock()
+	c.lastRequest = time.Now()
+	c.rateMu.Unlock()
+	return nil
+}
+
+func (c *HTTPClient) doRequest(ctx context.Context, client *http.Client, u string, body []byte, headers map[string]string, key string, attempt int) (raw []byte, status int, retryAfter time.Duration, err error) {
+	ctx, span := agentlog.Start(ctx, "model.HTTPClient.doRequest", map[string]any{"provider": c.Config.Name, "attempt": attempt})
+	defer func() {
+		span.End(map[string]any{"status": status, "response_bytes": len(raw), "retry_after_ms": retryAfter.Milliseconds()}, nil, err)
+	}()
+	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(body))
 	if err != nil {
-		return Response{}, err
+		return nil, 0, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range headers {
@@ -112,32 +185,27 @@ func (c *HTTPClient) Chat(ctx context.Context, r Request) (response Response, er
 		req.Header.Set("anthropic-version", "2023-06-01")
 	case "google":
 		req.Header.Set("x-goog-api-key", key)
-	case "ollama":
-		if key != "" {
-			req.Header.Set("Authorization", "Bearer "+key)
-		}
 	default:
 		if key != "" {
 			req.Header.Set("Authorization", "Bearer "+key)
 		}
 	}
-	client := c.HTTP
-	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
-	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return Response{}, err
+		return nil, 0, 0, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	raw, err = io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return Response{}, err
+		return nil, resp.StatusCode, 0, err
 	}
-	if resp.StatusCode >= 300 {
-		return Response{}, fmt.Errorf("%s HTTP %d (body withheld)", c.Config.Name, resp.StatusCode)
+	value := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if seconds, parseErr := strconv.Atoi(value); parseErr == nil && seconds >= 0 {
+		retryAfter = time.Duration(seconds) * time.Second
+	} else if at, parseErr := http.ParseTime(value); parseErr == nil {
+		retryAfter = time.Until(at)
 	}
-	return c.parse(ctx, raw)
+	return raw, resp.StatusCode, retryAfter, nil
 }
 func (c *HTTPClient) payload(ctx context.Context, r Request) (body map[string]any, path string, headers map[string]string, err error) {
 	_, span := agentlog.Start(ctx, "model.HTTPClient.payload", map[string]any{"protocol": c.Config.Protocol, "model": c.Config.Model, "request": r})
@@ -196,6 +264,14 @@ func (c *HTTPClient) payload(ctx context.Context, r Request) (body map[string]an
 			m["system"] = strings.Join(system, "\n")
 		}
 	}
+	// Some NIM-hosted reasoning models think by default. With an explicitly
+	// declared capability, off must be sent rather than merely omitted.
+	if p == "nim" && c.Config.ReasoningMode == "nim_enable_thinking" && (r.Reasoning == "" || r.Reasoning == "off") {
+		m["chat_template_kwargs"] = map[string]any{"enable_thinking": false}
+	}
+	if p == "nim" && c.Config.ReasoningMode == "nim_thinking_mode" && (r.Reasoning == "" || r.Reasoning == "off" || r.Reasoning == "disabled") {
+		m["chat_template_kwargs"] = map[string]any{"thinking_mode": "disabled"}
+	}
 	if r.Reasoning != "" && r.Reasoning != "off" {
 		mode := c.Config.ReasoningMode
 		if mode == "" || mode == "none" {
@@ -253,6 +329,18 @@ func (c *HTTPClient) payload(ctx context.Context, r Request) (body map[string]an
 				return nil, "", nil, errors.New("nim reasoning accepts on only")
 			}
 			m["chat_template_kwargs"] = map[string]any{"enable_thinking": true}
+		case "nim_thinking_mode":
+			if p != "nim" {
+				return nil, "", nil, errors.New("nim_thinking_mode requires nim")
+			}
+			value := r.Reasoning
+			if value == "on" {
+				value = "enabled"
+			}
+			if value != "enabled" && value != "adaptive" && value != "disabled" {
+				return nil, "", nil, errors.New("NIM thinking_mode accepts enabled, adaptive, or disabled")
+			}
+			m["chat_template_kwargs"] = map[string]any{"thinking_mode": value}
 		default:
 			return nil, "", nil, fmt.Errorf("unknown reasoning mode %s", mode)
 		}
@@ -297,6 +385,14 @@ func (c *HTTPClient) parse(ctx context.Context, raw []byte) (out Response, err e
 			msg := obj(obj(choices[0])["message"])
 			out.Text = str(msg["content"])
 			out.Reasoning = str(msg["reasoning_content"])
+			if out.Reasoning == "" {
+				out.Reasoning = str(msg["reasoning"])
+			}
+			if out.Text == "" {
+				for _, part := range arr(msg["content"]) {
+					out.Text += str(obj(part)["text"])
+				}
+			}
 		}
 	case "openai_responses":
 		for _, x := range arr(v["output"]) {
@@ -344,7 +440,12 @@ func (c *HTTPClient) parse(ctx context.Context, raw []byte) (out Response, err e
 	}
 	out.UsageKnown = out.InputTokens > 0 || out.OutputTokens > 0
 	if out.Text == "" {
-		return out, errors.New("provider returned no text")
+		finish := ""
+		choices := arr(v["choices"])
+		if len(choices) > 0 {
+			finish = str(obj(choices[0])["finish_reason"])
+		}
+		return out, fmt.Errorf("provider returned no text (finish_reason=%q, reasoning_chars=%d)", finish, len(out.Reasoning))
 	}
 	return out, nil
 }
