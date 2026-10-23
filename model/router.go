@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Disesfgewu/GSD_Survey/agent-template-client/agentlog"
 	"sort"
 )
 
@@ -13,7 +14,16 @@ type Entry struct {
 }
 type Router struct{ Entries []Entry }
 
-func (r Router) Chat(ctx context.Context, req Request) (Response, error) {
+func (r Router) Chat(ctx context.Context, req Request) (response Response, err error) {
+	ctx, span := agentlog.Start(ctx, "model.Router.Chat", req)
+	defer func() {
+		var tokens *int
+		if response.UsageKnown {
+			n := response.InputTokens + response.OutputTokens
+			tokens = &n
+		}
+		span.End(response, tokens, err)
+	}()
 	entries := append([]Entry(nil), r.Entries...)
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Config.Tier < entries[j].Config.Tier })
 	estimated := 0

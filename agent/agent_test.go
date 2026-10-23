@@ -2,8 +2,11 @@ package agent
 
 import (
 	"context"
+	"github.com/Disesfgewu/GSD_Survey/agent-template-client/agentlog"
 	"github.com/Disesfgewu/GSD_Survey/agent-template-client/gsd"
 	"github.com/Disesfgewu/GSD_Survey/agent-template-client/model"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +17,24 @@ type fakeModel struct{}
 
 func (fakeModel) Chat(_ context.Context, _ model.Request) (model.Response, error) {
 	return model.Response{Text: "ok", Model: "fake", Provider: "mock", InputTokens: 2, OutputTokens: 1, UsageKnown: true}, nil
+}
+
+type captureModel struct{ request model.Request }
+
+func (c *captureModel) Chat(_ context.Context, r model.Request) (model.Response, error) {
+	c.request = r
+	return model.Response{Text: "ok"}, nil
+}
+func TestSystemPromptIsInjected(t *testing.T) {
+	client := &captureModel{}
+	a := Template{Name: "prompt-test", SystemPrompt: "You are the fab audit agent.", LogDir: t.TempDir(), Model: client}
+	defer a.Close()
+	if _, err := a.Chat(context.Background(), []model.Message{{Role: "user", Content: "status"}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.request.Messages) != 2 || client.request.Messages[0].Role != "system" || client.request.Messages[0].Content != a.SystemPrompt {
+		t.Fatalf("messages=%+v", client.request.Messages)
+	}
 }
 func TestAutomaticLogger(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "log")
@@ -34,7 +55,7 @@ func TestAutomaticLogger(t *testing.T) {
 		t.Fatal(err)
 	}
 	line := string(b)
-	for _, want := range []string{"[DEBUG] agent:etch-agent", "func:Chat(input:", "return:", "token:3", "response_time:", "time:"} {
+	for _, want := range []string{"[DEBUG] agent:etch-agent", "phase:START", "phase:END", "func:agent.Template.Chat(input:", "return:", "token:3", "response_time:", "time:", "prev_hash:", "hash:"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("missing %s in %s", want, line)
 		}
@@ -65,5 +86,37 @@ func TestAskCitationTrace(t *testing.T) {
 	}
 	if !r.Finished || r.State["citation_valid"] != true || len(r.Steps) != 3 {
 		t.Fatalf("unexpected RAG trace %+v", r)
+	}
+}
+
+func TestFullAuditCallTree(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"card:K-VALVE"}}],"usage":{"prompt_tokens":4,"completion_tokens":2}}`))
+	}))
+	defer server.Close()
+	client, err := model.New(model.Config{Name: "mock", Protocol: "openai_chat", BaseURL: server.URL, Model: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := Template{Name: "audit-tree", LogDir: t.TempDir(), Model: client, Retriever: &LocalRetriever{Documents: []Document{{ID: "card:K-VALVE", Text: "pressure_high valve_position_mismatch", Source: "knowledge.json#K-VALVE"}}}}
+	r, err := a.Ask(context.Background(), "pressure_high valve_position_mismatch", "")
+	if err != nil || r.State["citation_valid"] != true {
+		t.Fatalf("result=%+v err=%v", r, err)
+	}
+	path := a.Logger.Path
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	records, err := agentlog.Verify(path)
+	if err != nil || records < 20 {
+		t.Fatalf("records=%d err=%v", records, err)
+	}
+	b, _ := os.ReadFile(path)
+	log := string(b)
+	for _, fn := range []string{"agent.Template.Ask", "graph.Graph.AddNode", "graph.Node.retrieve", "agent.LocalRetriever.Retrieve", "agent.tokens", "graph.Node.generate", "agent.Template.BuildMessages", "model.HTTPClient.Chat", "model.HTTPClient.payload", "model.HTTPClient.parse", "graph.Node.validate"} {
+		if !strings.Contains(log, "func:"+fn+"(") {
+			t.Errorf("missing audited function %s", fn)
+		}
 	}
 }

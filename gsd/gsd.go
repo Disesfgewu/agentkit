@@ -1,9 +1,11 @@
 package gsd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Disesfgewu/GSD_Survey/agent-template-client/agentlog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -54,6 +56,11 @@ type Knowledge struct {
 }
 
 func LoadKnowledge(path string) (Knowledge, error) {
+	return LoadKnowledgeContext(context.Background(), path)
+}
+func LoadKnowledgeContext(ctx context.Context, path string) (knowledge Knowledge, err error) {
+	_, span := agentlog.Start(ctx, "gsd.LoadKnowledge", map[string]any{"path": path})
+	defer func() { span.End(knowledge, nil, err) }()
 	var k Knowledge
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -78,6 +85,11 @@ func LoadKnowledge(path string) (Knowledge, error) {
 	return k, nil
 }
 func ReadJSONL[T any](path string) ([]T, error) {
+	return ReadJSONLContext[T](context.Background(), path)
+}
+func ReadJSONLContext[T any](ctx context.Context, path string) (items []T, err error) {
+	_, span := agentlog.Start(ctx, "gsd.ReadJSONL", map[string]any{"path": path})
+	defer func() { span.End(map[string]any{"items": len(items)}, nil, err) }()
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -96,6 +108,11 @@ func ReadJSONL[T any](path string) ([]T, error) {
 	return out, nil
 }
 func WriteJSONL[T any](path string, items []T) error {
+	return WriteJSONLContext(context.Background(), path, items)
+}
+func WriteJSONLContext[T any](ctx context.Context, path string, items []T) (err error) {
+	_, span := agentlog.Start(ctx, "gsd.WriteJSONL", map[string]any{"path": path, "items": items})
+	defer func() { span.End(map[string]any{"written": len(items)}, nil, err) }()
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
@@ -111,6 +128,11 @@ func WriteJSONL[T any](path string, items []T) error {
 	return os.WriteFile(path, []byte(b.String()), 0600)
 }
 func Match(c Case, k Knowledge) []Card {
+	return MatchContext(context.Background(), c, k)
+}
+func MatchContext(ctx context.Context, c Case, k Knowledge) (cards []Card) {
+	_, span := agentlog.Start(ctx, "gsd.Match", map[string]any{"case": c, "knowledge_schema": k.SchemaVersion})
+	defer func() { span.End(cards, nil, nil) }()
 	signals := map[string]bool{}
 	for _, s := range c.Signals {
 		signals[s] = true
@@ -136,8 +158,13 @@ func Match(c Case, k Knowledge) []Card {
 	return out
 }
 func Decide(c Case, k Knowledge) Prediction {
+	return DecideContext(context.Background(), c, k)
+}
+func DecideContext(ctx context.Context, c Case, k Knowledge) (prediction Prediction) {
+	ctx, span := agentlog.Start(ctx, "gsd.Decide", map[string]any{"case": c, "knowledge_schema": k.SchemaVersion})
+	defer func() { span.End(prediction, nil, nil) }()
 	p := Prediction{CaseID: c.CaseID, Decision: "insufficient_evidence", Action: "request_additional_measurement", CardIDs: []string{}, EvidenceIDs: []string{}, ObservationIDs: []string{}, Reason: "No knowledge card uniquely matches the observed signals."}
-	cards := Match(c, k)
+	cards := MatchContext(ctx, c, k)
 	if len(cards) == 0 {
 		return p
 	}
@@ -164,6 +191,11 @@ type Score struct {
 }
 
 func Evaluate(cases []Case, truth []Truth, pred []Prediction, k Knowledge) (Score, error) {
+	return EvaluateContext(context.Background(), cases, truth, pred, k)
+}
+func EvaluateContext(ctx context.Context, cases []Case, truth []Truth, pred []Prediction, k Knowledge) (score Score, err error) {
+	ctx, span := agentlog.Start(ctx, "gsd.Evaluate", map[string]any{"cases": cases, "truth": truth, "predictions": pred, "knowledge_schema": k.SchemaVersion})
+	defer func() { span.End(score, nil, err) }()
 	s := Score{Cases: len(cases)}
 	allowedFault := map[string]bool{"insufficient_evidence": true}
 	allowedAction := map[string]bool{"request_additional_measurement": true}
@@ -222,7 +254,7 @@ func Evaluate(cases []Case, truth []Truth, pred []Prediction, k Knowledge) (Scor
 		if validSchema {
 			s.SchemaValid++
 		}
-		matched := Match(c, k)
+		matched := MatchContext(ctx, c, k)
 		for _, card := range matched {
 			if len(p.CardIDs) == 1 && p.CardIDs[0] == card.ID && p.Decision == card.Fault && p.Action == card.Action {
 				valid := true

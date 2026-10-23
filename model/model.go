@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/Disesfgewu/GSD_Survey/agent-template-client/agentlog"
 	"io"
 	"net/http"
 	"net/url"
@@ -53,6 +54,11 @@ type HTTPClient struct {
 }
 
 func New(c Config) (*HTTPClient, error) {
+	return NewContext(context.Background(), c)
+}
+func NewContext(ctx context.Context, c Config) (client *HTTPClient, err error) {
+	_, span := agentlog.Start(ctx, "model.New", c)
+	defer func() { span.End(client, nil, err) }()
 	if c.Model == "" || c.BaseURL == "" {
 		return nil, errors.New("model and base_url required")
 	}
@@ -66,11 +72,20 @@ func New(c Config) (*HTTPClient, error) {
 	}
 	return &HTTPClient{Config: c, HTTP: &http.Client{Timeout: 60 * time.Second}}, nil
 }
-func (c *HTTPClient) Chat(ctx context.Context, r Request) (Response, error) {
+func (c *HTTPClient) Chat(ctx context.Context, r Request) (response Response, err error) {
+	ctx, span := agentlog.Start(ctx, "model.HTTPClient.Chat", map[string]any{"provider": c.Config.Name, "protocol": c.Config.Protocol, "model": c.Config.Model, "request": r})
+	defer func() {
+		var tokens *int
+		if response.UsageKnown {
+			n := response.InputTokens + response.OutputTokens
+			tokens = &n
+		}
+		span.End(response, tokens, err)
+	}()
 	if len(r.Messages) == 0 {
 		return Response{}, errors.New("messages required")
 	}
-	body, path, headers, err := c.payload(r)
+	body, path, headers, err := c.payload(ctx, r)
 	if err != nil {
 		return Response{}, err
 	}
@@ -122,9 +137,11 @@ func (c *HTTPClient) Chat(ctx context.Context, r Request) (Response, error) {
 	if resp.StatusCode >= 300 {
 		return Response{}, fmt.Errorf("%s HTTP %d (body withheld)", c.Config.Name, resp.StatusCode)
 	}
-	return c.parse(raw)
+	return c.parse(ctx, raw)
 }
-func (c *HTTPClient) payload(r Request) (map[string]any, string, map[string]string, error) {
+func (c *HTTPClient) payload(ctx context.Context, r Request) (body map[string]any, path string, headers map[string]string, err error) {
+	_, span := agentlog.Start(ctx, "model.HTTPClient.payload", map[string]any{"protocol": c.Config.Protocol, "model": c.Config.Model, "request": r})
+	defer func() { span.End(map[string]any{"body": body, "path": path, "headers": headers}, nil, err) }()
 	p := c.Config.Protocol
 	m := map[string]any{"model": c.Config.Model}
 	h := map[string]string{}
@@ -254,12 +271,21 @@ func (c *HTTPClient) payload(r Request) (map[string]any, string, map[string]stri
 	}
 	return nil, "", nil, errors.New("unsupported protocol")
 }
-func (c *HTTPClient) parse(raw []byte) (Response, error) {
+func (c *HTTPClient) parse(ctx context.Context, raw []byte) (out Response, err error) {
+	_, span := agentlog.Start(ctx, "model.HTTPClient.parse", map[string]any{"protocol": c.Config.Protocol, "response_bytes": len(raw)})
+	defer func() {
+		var tokens *int
+		if out.UsageKnown {
+			n := out.InputTokens + out.OutputTokens
+			tokens = &n
+		}
+		span.End(out, tokens, err)
+	}()
 	var v map[string]any
 	if err := json.Unmarshal(raw, &v); err != nil {
 		return Response{}, err
 	}
-	out := Response{Model: c.Config.Model, Provider: c.Config.Name}
+	out = Response{Model: c.Config.Model, Provider: c.Config.Name}
 	obj := func(x any) map[string]any { z, _ := x.(map[string]any); return z }
 	arr := func(x any) []any { z, _ := x.([]any); return z }
 	str := func(x any) string { z, _ := x.(string); return z }
