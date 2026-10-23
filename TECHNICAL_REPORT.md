@@ -25,6 +25,102 @@ Reasoning capability is **declared in each model configuration**; provider ident
 
 ## Dataset preview and field dictionary
 
+There are four distinct data levels. The JSON case shown later is the last, compact Agent-facing level:
+
+```text
+10 Hz raw numeric frames → 62 numeric wafer features → thresholded signal observations → Agent JSON case
+```
+
+### Original numeric frame preview: `raw/<split>/frames.parquet`
+
+The `agent_preview.yaml` template was generated with test seed `7202`. Its test split contains 1,565 wafers. Two selected wafers were rendered completely (one `gas_noise`, one nominal), producing 2,430 raw rows in a 3,583,460-byte Parquet file. A raw row represents one second for one signal group. There are nine groups and 417 channels in total; each channel contains ten samples per row at 10 Hz. The `values` array is flattened channel-major.
+
+Actual rows from timestamp `1790829326`, wafer `T001-W000093`, recipe step `0` (`load`) are shown below. Only the first eight numeric values of each much larger vector are displayed:
+
+| signal group | channels | rate | first eight values from `values` | event at this second |
+|---|---:|---:|---|---|
+| `pressure` | 40 | 10 Hz | `592.58966, 590.97473, 592.22900, 592.78620, 593.36240, 593.88666, 594.16140, 595.09503` | `step:load` |
+| `thermal` | 70 | 10 Hz | `60.06974, 60.06808, 60.04524, 60.02084, 60.02813, 60.04424, 60.03908, 60.06347` | `step:load`; `artifact:glitch` at offset 0.2 s |
+| `esc` | 40 | 10 Hz | `50.85323, 50.73583, 50.93241, 50.94079, 50.96508, 50.70732, 50.67946, 50.71257` | `step:load` |
+| `pump` | 30 | 10 Hz | `2.11600, 2.11008, 2.12330, 2.13055, 2.13388, 2.14094, 2.10403, 2.13181` | `step:load` |
+| `gas` | 60 | 10 Hz | `0, 0, 0, 0, 0, 0, 0, 0` | gas is off during this load step |
+| `rf` | 80 | 10 Hz | `0, 0, 0, 0, 0, 0, 0, 0` | RF is off during this load step |
+
+The nine group channel counts are gas 60, RF 80, pressure 40, thermal 70, ESC 40, endpoint 20, OES summary 60, pump 30, and arc 17. These add to 417. Zero values during `load` are process state, not missing data.
+
+| Raw field | Type | Meaning |
+|---|---|---|
+| `ts_sec` | int64 | Start time of this one-second frame. Ten samples per channel are stored for a 10 Hz group. |
+| `tool_id`, `chamber_id` | string | Synthetic equipment and chamber identity. |
+| `e10_state` | string | SEMI E10-like equipment state such as `productive`. |
+| `run_id`, `wafer_id`, `recipe_id` | string | Run, wafer, and recipe join keys. |
+| `step` | int32 | Numeric recipe-step index. It determines which subsystems should be active. |
+| `signal_group` | string | Subsystem whose channel vector appears in this row. |
+| `n_channels` | int32 | Number of physical/synthetic channels in the group. |
+| `sample_rate_hz` | float32 | Samples per second for every channel in the row. |
+| `values` | float32 array | Flattened channel-major numeric samples; normally `n_channels × sample_rate_hz` values for a one-second row. |
+| `events` | JSON string | Events inside the same second, including offset and duration. |
+| `truth_ref` | string | Reference to generator truth. It must be removed or access-controlled for an Agent-facing stream. |
+| `rng_key`, `prov_ref` | string | Reproduction/provenance identifiers used to regenerate and audit the frame. |
+
+The raw preview can be regenerated without committing the multi-megabyte Parquet output:
+
+```powershell
+cd generator
+go run ./cmd/dsbuild -template benchmarks/templates/agent_preview.yaml -out runs/agent_preview -workers 4
+go run ./cmd/dspreview -data runs/agent_preview -split test -start 78 -rows 4 -features 32 -raw-rows 10 -raw-values 8
+```
+
+### Numeric wafer features: `features.parquet`
+
+`features.parquet` is numeric but is already an aggregation of the raw 10 Hz stream. Each row represents one wafer and contains a 62-element float vector. `feature_names.json` maps each vector position to names such as `gas.bcl3_flow.mean`, `gas.bcl3_flow.std`, and `thermal.wall_temp.maxjump`.
+
+The table below uses actual test rows around the first generated `gas_noise` onset. The final two columns are joined from held-out truth only to explain the change; they are unavailable to the Agent.
+
+| seq / wafer | BCl3 mean | BCl3 std | Cl2 mean | Cl2 std | Ar std | N2 std | pressure mean | wall temp mean | evaluator-only fault / age |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 78 / `T001-W000078` | 751.6383 | 0.3794 | 753.5384 | 0.5272 | 0.2912 | 0.1795 | 1188.2762 | 60.2812 | none |
+| 79 / `T001-W000079` | 752.3683 | 2.4238 | 753.4254 | 4.8527 | 1.5561 | 1.2941 | 1187.5961 | 60.3005 | `gas_noise`, onset, age 0 |
+| 80 / `T001-W000080` | 752.1706 | 2.3444 | 752.4639 | 3.8663 | 1.4286 | 0.8909 | 1186.6315 | 60.3002 | `gas_noise`, age 1 |
+| 81 / `T001-W000081` | 751.3859 | 2.7397 | 752.9782 | 4.0291 | 1.6786 | 1.0187 | 1187.2465 | 60.2738 | `gas_noise`, age 2 |
+
+This example shows why an Agent signal such as `gas_flow_unstable` is derived from standard-deviation features instead of being present in the raw data. The BCl3 and Cl2 means remain close to their previous levels while their within-wafer variation increases sharply.
+
+| Feature-row field | Type | Meaning |
+|---|---|---|
+| `tool_id`, `tool_idx`, `wafer_id` | string/string-index | Equipment and wafer identifiers. |
+| `seq` | int32 | Wafer sequence within the tool trajectory. |
+| `ts_start` | int64 | Wafer start timestamp. |
+| `wafers_since_pm` | int32 | Wafers since preventive maintenance; `-1` means no prior PM in the generated observation window. |
+| `engineering` | bool | Engineering wafer flag; calibration excludes these rows. |
+| `features` | float32 array[62] | Numeric feature vector whose positions are defined by `feature_names.json`. |
+
+The Parquet vector does not store units beside each value. Units and channel meaning must be resolved through the versioned generator specification/provenance; these synthetic magnitudes must not be presented as vendor operating limits.
+
+### Numeric event and hidden truth preview
+
+The event table aligns generated fleet events with the wafer sequence:
+
+| tool | seq | timestamp | kind | detail | duration_s | value |
+|---|---:|---:|---|---|---:|---:|
+| `T001` | 79 | 1790826910 | `fault_onset` | `gas_noise` | 0 | 0.002737886 |
+| `T001` | 107 | 1790831727 | `repair` | `gas_noise` | 9269 | 0 |
+| `T001` | 159 | 1790849958 | `fault_onset` | `sensor_ramp` | 0 | 0.002437357 |
+
+For a `fault_onset`, `value` is the simulated onset hazard λ. For maintenance/repair events it is normally zero. `duration_s` is populated for downtime events.
+
+The matching `truth.parquet` rows contain numeric latent state and future-event answers. They are evaluator-only:
+
+| seq | fault_id | onset | age | wall deposit | window fouling | match drift | sensor drift | wafers to fault | wafers to unscheduled stop | glitches / dropouts |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 78 | none | false | 0 | 0.299357 | 0.092433 | 0.062803 | -0.008785 | 1 | 29 | 4 / 2 |
+| 79 | `gas_noise` | true | 0 | 0.300860 | 0.093186 | 0.058616 | -0.009806 | 0 | 28 | 6 / 4 |
+| 80 | `gas_noise` | false | 1 | 0.300869 | 0.093186 | 0.052595 | -0.012516 | 79 | 27 | 4 / 0 |
+
+These values explain and score the simulation. They must never be copied into RAG documents or model prompts.
+
+### Agent-level JSON dataset
+
 The committed seed42 diagnostic dataset contains 160 JSONL cases (`repeats_per_class: 20`). Each line is one independent synthetic etch-tool triage case. The manifest fixes seed, generator-spec hash, and knowledge hash so a run can verify which rule version produced it. Labels are constructed from GSD fault families; they are not observed fab failures.
 
 ### Observable case: `cases.jsonl`
