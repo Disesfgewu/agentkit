@@ -70,3 +70,12 @@ go run ./cmd/agentctl llm-eval -env .env -model nim -limit 8 -delay 10s -out ../
 The benchmark action strings are diagnostic suggestions for synthetic data, not equipment control commands or fab SOPs.
 
 See [technical report](TECHNICAL_REPORT.md) for protocol boundaries, actual 10 Hz raw numeric rows, wafer-feature tables around a fault onset, Agent JSON previews, field dictionaries, experiment results, and limitations.
+
+To inspect the Generator dataset as full CSV files rather than Agent JSON, run from `generator/`:
+
+```powershell
+go run ./cmd/dsbuild -template benchmarks/templates/agent_preview.yaml -out runs/agent_preview -workers 4
+go run ./cmd/dsexportcsv -data runs/agent_preview -split test -out runs/agent_preview_csv/test -raw=true
+```
+
+The measured preview export contains 1,125,900 raw numeric rows in `raw_values.csv`, plus complete feature, event, truth, and frame-metadata CSV files.

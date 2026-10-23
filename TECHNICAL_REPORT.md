@@ -31,9 +31,64 @@ There are four distinct data levels. The JSON case shown later is the last, comp
 10 Hz raw numeric frames → 62 numeric wafer features → thresholded signal observations → Agent JSON case
 ```
 
+### Complete generated CSV deliverable
+
+The Generator's canonical storage is Parquet because repeated 10 Hz arrays are much smaller there. `dsexportcsv` now exports the complete generated split into ordinary CSV files. The tested output exists locally at `generator/runs/agent_preview_csv/test/` and is intentionally ignored by Git.
+
+```text
+generator/runs/agent_preview_csv/test/
+├── features.csv       # all wafer rows and all 62 numeric features
+├── truth.csv          # all evaluator-only answers and latent numeric states
+├── events.csv         # all generated fleet events
+├── raw_frames.csv     # metadata for every generated one-second/group frame
+├── raw_values.csv     # normalized channel/sample/value rows
+└── csv_manifest.json  # row counts, byte sizes, and source split
+```
+
+Measured output from the deterministic test split:
+
+| CSV file | Rows | Columns/layout | Bytes |
+|---|---:|---|---:|
+| `features.csv` | 1,565 | 7 identity/context columns + 62 numeric features | 1,002,381 |
+| `truth.csv` | 1,565 | 28 evaluator-only label, latent-state, future-event, and artefact columns | 267,375 |
+| `events.csv` | 37 | 7 event timeline columns | 2,091 |
+| `raw_frames.csv` | 2,430 | 18 frame metadata/provenance columns | 3,325,017 |
+| `raw_values.csv` | 1,125,900 | frame/group/channel/sample/time-offset/value | 53,705,888 |
+
+The CSV files total 58,302,752 bytes before optional ZIP compression. `raw_frames.csv` joins to `raw_values.csv` through `frame_id`. This normalized form avoids repeating timestamps, event JSON, provenance, and channel lists for every one of the 1,125,900 numeric values.
+
+The actual beginning of `raw_values.csv` is:
+
+```csv
+frame_id,signal_group,channel_index,channel_id,sample_index,sample_offset_s,value
+0,gas,0,gas.bcl3_flow.00,0,0,0
+0,gas,0,gas.bcl3_flow.00,1,0.1,0
+0,gas,0,gas.bcl3_flow.00,2,0.2,0
+```
+
+The gas values are zero because frame 0 is the load step. A nonzero pressure channel in frame 2 is:
+
+```csv
+2,pressure,0,pressure.pressure.00,0,0,592.58966
+2,pressure,0,pressure.pressure.00,1,0.1,590.97473
+2,pressure,0,pressure.pressure.00,2,0.2,592.229
+2,pressure,0,pressure.pressure.00,3,0.3,592.7862
+2,pressure,0,pressure.pressure.00,4,0.4,593.3624
+```
+
+Generate and export the complete CSV split with:
+
+```powershell
+cd generator
+go run ./cmd/dsbuild -template benchmarks/templates/agent_preview.yaml -out runs/agent_preview -workers 4
+go run ./cmd/dsexportcsv -data runs/agent_preview -split test -out runs/agent_preview_csv/test -raw=true
+```
+
+`raw_windows.per_split` controls how many fault and nominal wafers receive complete 10 Hz output. The preview template uses one of each, while larger benchmark templates use more. Generating every channel for every wafer would create hundreds of millions of CSV rows, so normal benchmark runs store 62 wafer features for every wafer and retain full 10 Hz frames for selected explainability windows.
+
 ### Original numeric frame preview: `raw/<split>/frames.parquet`
 
-The `agent_preview.yaml` template was generated with test seed `7202`. Its test split contains 1,565 wafers. Two selected wafers were rendered completely (one `gas_noise`, one nominal), producing 2,430 raw rows in a 3,583,460-byte Parquet file. A raw row represents one second for one signal group. There are nine groups and 417 channels in total; each channel contains ten samples per row at 10 Hz. The `values` array is flattened channel-major.
+The `agent_preview.yaml` template was generated with test seed `7202`. Its test split contains 1,565 wafers. Two selected wafers were rendered completely (one `gas_noise`, one nominal), producing 2,430 raw rows in a 3,623,878-byte Parquet file. A raw row represents one second for one signal group. There are nine groups and 417 channels in total; each channel contains ten samples per row at 10 Hz. The `values` array is flattened channel-major.
 
 Actual rows from timestamp `1790829326`, wafer `T001-W000093`, recipe step `0` (`load`) are shown below. Only the first eight numeric values of each much larger vector are displayed:
 
@@ -58,6 +113,7 @@ The nine group channel counts are gas 60, RF 80, pressure 40, thermal 70, ESC 40
 | `signal_group` | string | Subsystem whose channel vector appears in this row. |
 | `n_channels` | int32 | Number of physical/synthetic channels in the group. |
 | `sample_rate_hz` | float32 | Samples per second for every channel in the row. |
+| `channel_ids` | string array | Ordered IDs matching `channel_index`, for example `pressure.pressure.00`. This is stored in the raw Parquet so values remain interpretable without reconstructing fleet ordering. |
 | `values` | float32 array | Flattened channel-major numeric samples; normally `n_channels × sample_rate_hz` values for a one-second row. |
 | `events` | JSON string | Events inside the same second, including offset and duration. |
 | `truth_ref` | string | Reference to generator truth. It must be removed or access-controlled for an Agent-facing stream. |
