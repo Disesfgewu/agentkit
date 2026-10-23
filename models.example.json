@@ -1,0 +1,7 @@
+[
+  {"name":"openai","protocol":"openai_responses","base_url":"${OPENAI_BASE_URL}","model":"${OPENAI_MODEL}","api_key_env":"OPENAI_API_KEY","reasoning_mode":"openai_effort","context_tokens":128000,"tier":1},
+  {"name":"anthropic","protocol":"anthropic","base_url":"${ANTHROPIC_BASE_URL}","model":"${ANTHROPIC_MODEL}","api_key_env":"ANTHROPIC_API_KEY","reasoning_mode":"anthropic_adaptive","context_tokens":200000,"tier":1},
+  {"name":"google","protocol":"google","base_url":"${GOOGLE_BASE_URL}","model":"${GOOGLE_MODEL}","api_key_env":"GOOGLE_API_KEY","reasoning_mode":"google_level","context_tokens":100000,"tier":1},
+  {"name":"nim","protocol":"nim","base_url":"${NVIDIA_BASE_URL}","model":"${NVIDIA_MODEL}","api_key_env":"NVIDIA_API_KEY","reasoning_mode":"nim_enable_thinking","context_tokens":32000,"tier":2},
+  {"name":"ollama","protocol":"ollama","base_url":"${OLLAMA_BASE_URL}","model":"${OLLAMA_MODEL}","reasoning_mode":"ollama_think","context_tokens":8192,"tier":3}
+]
