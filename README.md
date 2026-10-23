@@ -69,4 +69,4 @@ go run ./cmd/agentctl llm-eval -env .env -model nim -limit 8 -delay 10s -out ../
 
 The benchmark action strings are diagnostic suggestions for synthetic data, not equipment control commands or fab SOPs.
 
-See [technical report](TECHNICAL_REPORT.md) for protocol boundaries, experiment results, and limitations.
+See [technical report](TECHNICAL_REPORT.md) for protocol boundaries, dataset previews and field dictionaries, experiment results, and limitations.

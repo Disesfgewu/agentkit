@@ -15,6 +15,9 @@ func TestLegacySeed42(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if cases[0].Context.EventProtocol != "GEM-like JSON abstraction" || cases[0].Context.RecipeStep != "main_etch" || cases[0].Source.Seed != 42 || cases[0].Source.SpecSHA256 == "" {
+		t.Fatalf("case metadata was not preserved: %+v", cases[0])
+	}
 	truth, err := ReadJSONL[Truth](filepath.Join(root, "runs", "seed42", "truth.jsonl"))
 	if err != nil {
 		t.Fatal(err)

@@ -13,10 +13,21 @@ import (
 )
 
 type Case struct {
-	CaseID        string   `json:"case_id"`
-	Signals       []string `json:"signals"`
-	ToolID        string   `json:"tool_id"`
-	EquipmentType string   `json:"equipment_type"`
+	CaseID        string      `json:"case_id"`
+	Signals       []string    `json:"signals"`
+	ToolID        string      `json:"tool_id"`
+	EquipmentType string      `json:"equipment_type"`
+	Context       CaseContext `json:"context"`
+	Source        CaseSource  `json:"source"`
+}
+type CaseContext struct {
+	EventProtocol string `json:"event_protocol"`
+	RecipeStep    string `json:"recipe_step"`
+}
+type CaseSource struct {
+	Kind       string `json:"kind"`
+	Seed       int    `json:"seed"`
+	SpecSHA256 string `json:"spec_sha256"`
 }
 type Truth struct {
 	CaseID       string `json:"case_id"`

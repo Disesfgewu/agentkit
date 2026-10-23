@@ -23,6 +23,143 @@ The reference [agent-client-template](https://github.com/Disesfgewu/agent-client
 
 Reasoning capability is **declared in each model configuration**; provider identity alone is insufficient. For example, Anthropic adaptive thinking applies to compatible Claude versions, while older models may use budget tokens; the NIM option is supported only by NIM models that expose it. The `Reasoning` request is omitted when blank. These mappings follow [OpenAI reasoning](https://developers.openai.com/api/docs/guides/reasoning), [Google thinking](https://ai.google.dev/gemini-api/docs/thinking), [Anthropic extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking), [Ollama API](https://github.com/ollama/ollama/blob/main/docs/api.md), and [NVIDIA NIM LLM APIs](https://docs.api.nvidia.com/nim/reference/llm-apis). Configure a model's actual capability before enabling a mode. HTTP mock tests verify request paths, encoding, and response parsing; they do not prove a selected live model accepts the configured mode.
 
+## Dataset preview and field dictionary
+
+The committed seed42 diagnostic dataset contains 160 JSONL cases (`repeats_per_class: 20`). Each line is one independent synthetic etch-tool triage case. The manifest fixes seed, generator-spec hash, and knowledge hash so a run can verify which rule version produced it. Labels are constructed from GSD fault families; they are not observed fab failures.
+
+### Observable case: `cases.jsonl`
+
+This is the input that an Agent may read. A formatted version of the first record is:
+
+```json
+{
+  "case_id": "CASE-00000",
+  "context": {
+    "event_protocol": "GEM-like JSON abstraction",
+    "recipe_step": "main_etch"
+  },
+  "equipment_type": "synthetic_plasma_etcher",
+  "signals": [
+    "carrier_id_known",
+    "valve_position_mismatch",
+    "pressure_high"
+  ],
+  "source": {
+    "kind": "GSD-spec-linked rule vignette",
+    "seed": 42,
+    "spec_sha256": "7f3535185416fb6f03dadb86cf1ade00f30c841f203c2f91e804b2edc1183ec5"
+  },
+  "tool_id": "ETCH-002"
+}
+```
+
+| Field | Type | Meaning and use |
+|---|---|---|
+| `case_id` | string | Stable join key across case, prediction, and held-out truth. It is an example ID, not an equipment event ID. |
+| `context.event_protocol` | string | Declares that this record uses a GEM-like JSON abstraction. It does not claim that the signal names are official GEM alarm IDs. |
+| `context.recipe_step` | string | Process phase in which the observations apply; cards may be recipe-step sensitive. |
+| `equipment_type` | string | Synthetic equipment family. It prevents silently applying an etcher card to another equipment class. |
+| `signals` | string array | Observable categorical facts supplied to rule matching or the LLM. These contain no ground-truth fault label. |
+| `source.kind` | string | How the case was constructed. Here it identifies a spec-linked synthetic vignette. |
+| `source.seed` | integer | Reproduction seed for generated cases. |
+| `source.spec_sha256` | string | Exact GSD rule-spec fingerprint used to create the case. This guards against comparing cases from different rule versions. |
+| `tool_id` | string | Synthetic tool identifier used for tool-level grouping and held-out-tool experiments. It is not a real fab asset ID. |
+
+`masked_cases.jsonl` has the same schema but deliberately removes a decisive signal. Its corresponding expected result is usually `insufficient_evidence`, which tests whether the Agent abstains instead of guessing.
+
+### Knowledge card: `knowledge.json`
+
+Knowledge is supplied separately from observations. One card looks like:
+
+```json
+{
+  "id": "K-VALVE",
+  "fault": "valve_stick",
+  "required": ["pressure_high", "valve_position_mismatch"],
+  "action": "inspect_valve_position_trace",
+  "checks": [
+    "Compare commanded and actual valve positions",
+    "Review chamber pressure trend and recipe step"
+  ],
+  "evidence": ["gsd_rules"],
+  "basis": "generator_hypothesis"
+}
+```
+
+| Field | Type | Meaning and use |
+|---|---|---|
+| `schema_version` | string | Version of the overall knowledge-file schema. |
+| `scope` | string | Safety and applicability statement for all cards in the file. |
+| `sources` | map | Evidence registry keyed by source ID. Each entry contains `kind`, `uri`, and the limited `claim` supported by that source. |
+| `cards[].id` | string | Stable citation ID returned in `card_ids`. |
+| `cards[].fault` | string | Allowed structured diagnosis when the card uniquely matches. |
+| `cards[].required` | string array | Every listed signal must occur in the observable case. |
+| `cards[].forbidden` | string array, optional | The card is rejected if any listed signal occurs. |
+| `cards[].action` | string | Allowed next diagnostic action. It is a synthetic benchmark suggestion, not a maintenance command. |
+| `cards[].checks` | string array | Human-readable inspections supporting the action. |
+| `cards[].evidence` | string array | IDs that must resolve in the top-level `sources` registry. |
+| `cards[].basis` | string | Provenance class. `generator_hypothesis` prevents presenting the rule as an equipment-vendor or SEMI requirement. |
+
+### Agent output: predictions JSONL
+
+The deterministic baseline and an LLM must use the same output contract:
+
+```json
+{
+  "case_id": "CASE-00000",
+  "decision": "valve_stick",
+  "action": "inspect_valve_position_trace",
+  "card_ids": ["K-VALVE"],
+  "evidence_ids": ["gsd_rules"],
+  "observation_ids": [],
+  "reason": "Matched observed signals: pressure_high, valve_position_mismatch"
+}
+```
+
+| Field | Type | Validation rule |
+|---|---|---|
+| `case_id` | string | Must equal an input case ID exactly. |
+| `decision` | string | Must be a card fault or `insufficient_evidence`; words such as `matched` are schema errors. |
+| `action` | string | Must equal the selected card action or `request_additional_measurement` for abstention. |
+| `card_ids` | string array | Identifies the exact card used. Empty for abstention. |
+| `evidence_ids` | string array | Must resolve to evidence attached to the selected card, not merely any known source. |
+| `observation_ids` | string array | References measured channels/threshold observations for Parquet-derived cases. Synthetic vignettes have no numeric observation records, so this is empty. |
+| `reason` | string | Human-readable explanation retained for audit. It is required but not used as a substitute for structured validation. |
+
+### Held-out answer: `truth.jsonl`
+
+```json
+{
+  "action": "inspect_valve_position_trace",
+  "case_id": "CASE-00000",
+  "fault": "valve_stick",
+  "scenario_card": "K-VALVE"
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `case_id` | string | Join key for offline scoring. |
+| `fault` | string | Generator-authored expected class. |
+| `action` | string | Generator-authored expected diagnostic action. |
+| `scenario_card` | string, optional | Card used to construct a positive case; absent for intentional insufficient-evidence cases. |
+
+`truth.jsonl` must never enter retrieval, prompts, `Template.Triage`, or model context. Only `benchmark`, `evaluate`, and `llm-eval` read it after predictions exist. The audit log therefore shows when truth is opened and makes accidental leakage reviewable.
+
+### Upstream GSD Parquet layers
+
+The JSONL cases are the compact Agent-facing layer. The generator can also produce the following wafer/process layers:
+
+| File | Row granularity | Visible to Agent? | Main contents |
+|---|---|---:|---|
+| `features.parquet` | one row per wafer | yes, through the adapter | Observable context such as `wafers_since_pm`, engineering flag, and aggregated process features. |
+| `feature_names.json` | dataset-level mapping | yes | Stable mapping between feature indices/names and measured channels. |
+| `events.parquet` | one row per generated event | after an event adapter is added | Fault onset and maintenance/event timeline. The current Go template does not ingest this directly. |
+| `raw/<split>/frames.parquet` | one row per sampled frame | selectively | High-volume time series for trace or waveform tools. |
+| `truth.parquet` | one row per wafer | evaluator only | Hidden fault ID/type/family, latent states, event counters, and future-event distances. |
+
+The observable Parquet adapter fits thresholds only on the train split, then emits test-side signal flags plus channel, measured value, fitted threshold, source file, and calibration split. Truth remains in a separate scorer. This separation is the required pattern when replacing synthetic fields with real MES, FDC, SPC, or maintenance data.
+
 ## Data and decision flow
 
 ```mermaid
