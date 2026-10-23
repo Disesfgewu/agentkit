@@ -34,6 +34,7 @@ type Response struct {
 	InputTokens  int    `json:"input_tokens,omitempty"`
 	OutputTokens int    `json:"output_tokens,omitempty"`
 	UsageKnown   bool   `json:"-"`
+	Attempts     int    `json:"attempts,omitempty"`
 }
 type Client interface {
 	Chat(context.Context, Request) (Response, error)
@@ -118,7 +119,9 @@ func (c *HTTPClient) Chat(ctx context.Context, r Request) (response Response, er
 		}
 		raw, status, retryAfter, requestErr := c.doRequest(ctx, client, u, b, headers, key, attempt)
 		if requestErr == nil && status < 300 {
-			return c.parse(ctx, raw)
+			parsed, parseErr := c.parse(ctx, raw)
+			parsed.Attempts = attempt + 1
+			return parsed, parseErr
 		}
 		retryable := status == http.StatusTooManyRequests || status == 500 || status == 502 || status == 503 || status == 504
 		if !retryable || attempt >= maxRetries {
@@ -148,11 +151,11 @@ func (c *HTTPClient) awaitRate(ctx context.Context) error {
 	}
 	interval := time.Minute / time.Duration(c.Config.RequestsPerMinute)
 	c.rateMu.Lock()
+	defer c.rateMu.Unlock()
 	wait := time.Until(c.lastRequest.Add(interval))
 	if wait < 0 {
 		wait = 0
 	}
-	c.rateMu.Unlock()
 	if wait > 0 {
 		select {
 		case <-ctx.Done():
@@ -160,9 +163,7 @@ func (c *HTTPClient) awaitRate(ctx context.Context) error {
 		case <-time.After(wait):
 		}
 	}
-	c.rateMu.Lock()
 	c.lastRequest = time.Now()
-	c.rateMu.Unlock()
 	return nil
 }
 
