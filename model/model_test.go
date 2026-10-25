@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestProtocols(t *testing.T) {
@@ -68,6 +69,27 @@ func TestRetriesRateLimitAndHonorsBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	response, err := c.Chat(context.Background(), Request{Messages: []Message{{Role: "user", Content: "hi"}}})
+	if err != nil || response.Text != "ok" || calls.Load() != 2 {
+		t.Fatalf("response=%+v calls=%d err=%v", response, calls.Load(), err)
+	}
+}
+
+func TestRetriesTransportTimeoutWhileCallerContextIsValid(t *testing.T) {
+	var calls atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			time.Sleep(30 * time.Millisecond)
+			return
+		}
+		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
+	}))
+	defer s.Close()
+	client, err := New(Config{Name: "timeout", Protocol: "openai_chat", BaseURL: s.URL, Model: "test", MaxRetries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.HTTP.Timeout = 10 * time.Millisecond
+	response, err := client.Chat(context.Background(), Request{Messages: []Message{{Role: "user", Content: "hi"}}})
 	if err != nil || response.Text != "ok" || calls.Load() != 2 {
 		t.Fatalf("response=%+v calls=%d err=%v", response, calls.Load(), err)
 	}

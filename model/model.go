@@ -123,7 +123,9 @@ func (c *HTTPClient) Chat(ctx context.Context, r Request) (response Response, er
 			parsed.Attempts = attempt + 1
 			return parsed, parseErr
 		}
-		retryable := status == http.StatusTooManyRequests || status == 500 || status == 502 || status == 503 || status == 504
+		// A transport timeout/reset is retryable when the caller's own context is
+		// still valid. Caller cancellation remains terminal.
+		retryable := (requestErr != nil && ctx.Err() == nil) || status == http.StatusTooManyRequests || status == 500 || status == 502 || status == 503 || status == 504
 		if !retryable || attempt >= maxRetries {
 			if requestErr != nil {
 				return Response{}, requestErr
