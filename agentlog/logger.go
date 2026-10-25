@@ -203,7 +203,10 @@ func Verify(path string) (records int, err error) {
 	}
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	// Historical runs may contain a large final workflow summary. New platform
+	// runs cap inline summary items, but the verifier remains backward-compatible
+	// with those immutable audit files.
+	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
 	previous := ""
 	expected := uint64(1)
 	for scanner.Scan() {
