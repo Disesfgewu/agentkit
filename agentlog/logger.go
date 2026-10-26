@@ -20,6 +20,7 @@ var unsafeName = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
 var sequencePattern = regexp.MustCompile(`, seq:([0-9]+),`)
 
 type Recorder struct {
+	writeErr  error
 	mu        sync.Mutex
 	file      *os.File
 	AgentName string
@@ -84,7 +85,7 @@ func WithEffectiveTime(ctx context.Context, effectiveAt time.Time) context.Conte
 	return context.WithValue(ctx, effectiveTimeKey{}, effectiveAt.UTC().Format(time.RFC3339Nano))
 }
 
-// Start writes a START record and returns a child context carrying its call ID.
+// Start allocates a call ID; End writes exactly one completion record.
 func Start(ctx context.Context, function string, input any) (context.Context, *Span) {
 	r := FromContext(ctx)
 	effectiveAt, _ := ctx.Value(effectiveTimeKey{}).(string)
@@ -165,6 +166,9 @@ func (r *Recorder) write(phase, function string, input, output any, tokens *int,
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.writeErr != nil {
+		return r.writeErr
+	}
 	tokenText := "?"
 	if tokens != nil {
 		tokenText = fmt.Sprint(*tokens)
@@ -182,10 +186,15 @@ func (r *Recorder) write(phase, function string, input, output any, tokens *int,
 	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(body)))
 	r.lastHash = hash
 	if _, e := r.file.WriteString("[DEBUG] " + body + ", hash:" + hash + "\n"); e != nil {
+		r.writeErr = e
 		return e
 	}
-	return r.file.Sync()
+	r.writeErr = r.file.Sync()
+	return r.writeErr
 }
+
+// Err exposes failures even when a nested span's deferred completion cannot return one.
+func (r *Recorder) Err() error { r.mu.Lock(); defer r.mu.Unlock(); return r.writeErr }
 func (r *Recorder) Close() error {
 	if r == nil {
 		return nil
