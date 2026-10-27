@@ -2,51 +2,73 @@ package agentlog
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
+var ErrClosed = errors.New("audit session is closing or closed")
 var unsafeName = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
 var sequencePattern = regexp.MustCompile(`, seq:([0-9]+),`)
-
-type Recorder struct {
-	writeErr  error
-	mu        sync.Mutex
-	file      *os.File
-	AgentName string
-	Path      string
-	SessionID string
-	seq       uint64
-	callSeq   atomic.Uint64
-	lastHash  string
-}
+var callPattern = regexp.MustCompile(`, call_id:([0-9]+), parent_call_id:([0-9]+),`)
+var urls = regexp.MustCompile(`https?://[^\s"<>]+`)
 
 type contextKey struct{}
 type callKey struct{}
 type effectiveTimeKey struct{}
+
+type Recorder struct {
+	mu                         sync.Mutex
+	cond                       *sync.Cond
+	file, journal              *os.File
+	AgentName, Path, SessionID string
+	seq, callSeq               uint64
+	lastHash                   string
+	writeErr, closeErr         error
+	closing, closed            bool
+	active                     map[uint64]bool
+}
 type Span struct {
 	recorder         *Recorder
 	function         string
-	input            any
+	input            json.RawMessage
 	started          time.Time
 	effectiveAt      string
 	callID, parentID uint64
 	once             sync.Once
+	own              bool
+	startErr, endErr error
+}
+type beginRecord struct {
+	CallID   uint64          `json:"call_id"`
+	ParentID uint64          `json:"parent_call_id"`
+	Function string          `json:"function"`
+	Input    json.RawMessage `json:"input"`
+	Time     time.Time       `json:"time"`
+}
+type seal struct {
+	Records               uint64
+	LastHash, JournalHash string
+	Calls                 uint64
 }
 
-func New(agentName, dir string) (*Recorder, error) {
-	if agentName == "" {
-		agentName = "agent"
+func New(name, dir string) (*Recorder, error) {
+	if name == "" {
+		name = "agent"
 	}
 	if dir == "" {
 		dir = "log"
@@ -54,19 +76,34 @@ func New(agentName, dir string) (*Recorder, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
-	safe := unsafeName.ReplaceAllString(agentName, "_")
-	stamp := time.Now().Format("2006-01-02-15-04-05.000000000")
-	path := filepath.Join(dir, safe+"_"+stamp+".log")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if err != nil {
-		return nil, err
+	var nonce [8]byte
+	if _, e := rand.Read(nonce[:]); e != nil {
+		return nil, e
 	}
-	return &Recorder{file: f, AgentName: agentName, Path: path, SessionID: safe + "_" + stamp}, nil
+	safe := unsafeName.ReplaceAllString(name, "_")
+	session := safe + "_" + time.Now().Format("2006-01-02-15-04-05.000000000") + fmt.Sprintf("_%x", nonce)
+	path := filepath.Join(dir, session+".log")
+	f, e := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if e != nil {
+		return nil, e
+	}
+	journal, e := os.OpenFile(path+".journal", os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+	if e != nil {
+		f.Close()
+		return nil, e
+	}
+	r := &Recorder{file: f, journal: journal, AgentName: safe, Path: path, SessionID: session, active: map[uint64]bool{}}
+	r.cond = sync.NewCond(&r.mu)
+	return r, nil
 }
-
-// WithRecorder attaches one audit session to the full downstream call tree.
-func WithRecorder(ctx context.Context, recorder *Recorder) context.Context {
-	return context.WithValue(ctx, contextKey{}, recorder)
+func WithRecorder(ctx context.Context, r *Recorder) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if FromContext(ctx) != r {
+		ctx = context.WithValue(ctx, callKey{}, uint64(0))
+	}
+	return context.WithValue(ctx, contextKey{}, r)
 }
 func FromContext(ctx context.Context) *Recorder {
 	if ctx == nil {
@@ -75,97 +112,200 @@ func FromContext(ctx context.Context) *Recorder {
 	r, _ := ctx.Value(contextKey{}).(*Recorder)
 	return r
 }
-
-// WithEffectiveTime attaches the business/event time at which an operation's
-// input became effective. It is distinct from the system time and duration.
-func WithEffectiveTime(ctx context.Context, effectiveAt time.Time) context.Context {
-	if effectiveAt.IsZero() {
+func WithEffectiveTime(ctx context.Context, t time.Time) context.Context {
+	if t.IsZero() {
 		return ctx
 	}
-	return context.WithValue(ctx, effectiveTimeKey{}, effectiveAt.UTC().Format(time.RFC3339Nano))
+	return context.WithValue(ctx, effectiveTimeKey{}, t.UTC().Format(time.RFC3339Nano))
 }
 
-// Start allocates a call ID; End writes exactly one completion record.
-func Start(ctx context.Context, function string, input any) (context.Context, *Span) {
-	r := FromContext(ctx)
-	effectiveAt, _ := ctx.Value(effectiveTimeKey{}).(string)
-	if r == nil {
-		return ctx, &Span{function: function, input: input, started: time.Now(), effectiveAt: effectiveAt}
+// Standalone operations get an automatically owned session. Nested operations
+// inherit one session. Begin is durable in a journal; .log has one completion.
+func Start(ctx context.Context, name string, input any) (context.Context, *Span) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	parent, _ := ctx.Value(callKey{}).(uint64)
-	id := r.callSeq.Add(1)
-	s := &Span{recorder: r, function: function, input: input, started: time.Now(), effectiveAt: effectiveAt, callID: id, parentID: parent}
-	return context.WithValue(ctx, callKey{}, id), s
+	s := &Span{function: strings.NewReplacer("\r", "_", "\n", "_").Replace(name), input: json.RawMessage(safeJSON(input)), started: time.Now()}
+	r := FromContext(ctx)
+	if r == nil {
+		var e error
+		r, e = New(name, "")
+		if e != nil {
+			s.startErr = e
+			return ctx, s
+		}
+		s.own = true
+		ctx = WithRecorder(ctx, r)
+	}
+	s.recorder = r
+	s.effectiveAt, _ = ctx.Value(effectiveTimeKey{}).(string)
+	s.parentID, _ = ctx.Value(callKey{}).(uint64)
+	r.mu.Lock()
+	if r.writeErr != nil {
+		s.startErr = r.writeErr
+	} else if r.closed || (r.closing && !r.active[s.parentID]) {
+		s.startErr = ErrClosed
+	}
+	if s.startErr == nil {
+		if !r.active[s.parentID] {
+			s.parentID = 0
+		}
+		r.callSeq++
+		s.callID = r.callSeq
+		b, e := json.Marshal(beginRecord{s.callID, s.parentID, s.function, s.input, time.Now().UTC()})
+		if e == nil {
+			_, e = r.journal.Write(append(b, '\n'))
+		}
+		if e == nil {
+			e = r.journal.Sync()
+		}
+		if e != nil {
+			r.writeErr = e
+			s.startErr = e
+		} else {
+			r.active[s.callID] = true
+		}
+	}
+	r.mu.Unlock()
+	return context.WithValue(ctx, callKey{}, s.callID), s
 }
-func (s *Span) End(output any, tokens *int, err error) {
+func (s *Span) Err() error { return s.startErr }
+func (s *Span) Require() {
+	if s.startErr != nil {
+		panic(s.startErr)
+	}
+}
+func (s *Span) End(out any, tokens *int, operationErr error) error {
 	if s == nil {
-		return
+		return nil
 	}
 	s.once.Do(func() {
-		if s.recorder != nil {
-			_ = s.recorder.write("END", s.function, s.input, output, tokens, time.Since(s.started), err, s.callID, s.parentID, s.effectiveAt)
+		s.endErr = s.startErr
+		if s.recorder != nil && s.startErr == nil {
+			r := s.recorder
+			r.mu.Lock()
+			s.endErr = r.writeLocked(s, out, tokens, operationErr)
+			delete(r.active, s.callID)
+			r.cond.Broadcast()
+			r.mu.Unlock()
+		}
+		if s.own {
+			s.endErr = errors.Join(s.endErr, s.recorder.Close())
 		}
 	})
+	return s.endErr
 }
 
-// Call is the audit wrapper for extension functions implemented outside this module.
-func Call[T any](ctx context.Context, function string, input any, fn func(context.Context) (T, error)) (output T, err error) {
-	ctx, span := Start(ctx, function, input)
-	defer func() { span.End(output, nil, err) }()
+// Finish must be deferred directly. It preserves panic evidence and partial
+// output, returns audit failures through errp, and rethrows business panics.
+func (s *Span) Finish(errp *error, output func() any, tokens func() *int) {
+	p := recover()
+	var opErr error
+	if errp != nil {
+		opErr = *errp
+	}
+	if p != nil {
+		opErr = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
+	}
+	var out any
+	if output != nil {
+		out = output()
+	}
+	var tok *int
+	if tokens != nil {
+		tok = tokens()
+	}
+	auditErr := s.End(out, tok, opErr)
+	if errp != nil {
+		*errp = errors.Join(*errp, auditErr)
+	}
+	if p != nil {
+		panic(p)
+	}
+	if errp == nil && auditErr != nil {
+		panic(auditErr)
+	}
+}
+func Call[T any](ctx context.Context, name string, input any, fn func(context.Context) (T, error)) (out T, err error) {
+	ctx, s := Start(ctx, name, input)
+	defer s.Finish(&err, func() any { return out }, nil)
+	if err = s.Err(); err != nil {
+		return
+	}
 	return fn(ctx)
 }
 func sensitive(k string) bool {
 	k = strings.ToLower(k)
-	for _, s := range []string{"api_key", "apikey", "authorization", "password", "secret", "credential", "access_token", "refresh_token"} {
-		if strings.Contains(k, s) {
+	for _, s := range []string{"api_key", "apikey", "authorization", "password", "secret", "credential", "access_token", "refresh_token", "x-goog-api-key", "token"} {
+		if strings.Contains(k, s) && k != "input_tokens" && k != "output_tokens" && k != "max_output_tokens" && k != "context_tokens" && k != "total_tokens" {
 			return true
 		}
 	}
 	return false
 }
+func redactString(s string) string {
+	return urls.ReplaceAllStringFunc(s, func(raw string) string {
+		u, e := url.Parse(raw)
+		if e != nil {
+			return "[REDACTED_URL]"
+		}
+		if u.User != nil {
+			u.User = url.User("[REDACTED]")
+		}
+		q := u.Query()
+		for k := range q {
+			if sensitive(k) {
+				q.Set(k, "[REDACTED]")
+			}
+		}
+		u.RawQuery = q.Encode()
+		return u.String()
+	})
+}
 func redact(v any) any {
 	switch x := v.(type) {
 	case map[string]any:
 		out := map[string]any{}
-		for k, value := range x {
+		for k, v := range x {
 			if sensitive(k) {
 				out[k] = "[REDACTED]"
 			} else {
-				out[k] = redact(value)
+				out[k] = redact(v)
 			}
 		}
 		return out
 	case []any:
 		out := make([]any, len(x))
-		for i, value := range x {
-			out[i] = redact(value)
+		for i, v := range x {
+			out[i] = redact(v)
 		}
 		return out
+	case string:
+		return redactString(x)
 	default:
 		return v
 	}
 }
 func safeJSON(v any) string {
-	b, err := json.Marshal(v)
-	if err != nil {
+	b, e := json.Marshal(v)
+	if e != nil {
 		return `"[UNSERIALIZABLE]"`
 	}
 	var raw any
-	if json.Unmarshal(b, &raw) != nil {
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.UseNumber()
+	if d.Decode(&raw) != nil {
 		return `"[UNSERIALIZABLE]"`
 	}
 	clean, _ := json.Marshal(redact(raw))
 	return string(clean)
 }
-func (r *Recorder) Record(function string, input, output any, tokens *int, elapsed time.Duration, err error) error {
-	return r.write("END", function, input, output, tokens, elapsed, err, r.callSeq.Add(1), 0, "")
+func (r *Recorder) Record(name string, in, out any, tokens *int, elapsed time.Duration, e error) error {
+	_, s := Start(WithRecorder(context.Background(), r), name, in)
+	s.started = time.Now().Add(-elapsed)
+	return s.End(out, tokens, e)
 }
-func (r *Recorder) write(phase, function string, input, output any, tokens *int, elapsed time.Duration, err error, callID, parentID uint64, effectiveAt string) error {
-	if r == nil {
-		return nil
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
+func (r *Recorder) writeLocked(s *Span, out any, tokens *int, opErr error) error {
 	if r.writeErr != nil {
 		return r.writeErr
 	}
@@ -173,83 +313,181 @@ func (r *Recorder) write(phase, function string, input, output any, tokens *int,
 	if tokens != nil {
 		tokenText = fmt.Sprint(*tokens)
 	}
-	if effectiveAt == "" {
-		effectiveAt = "?"
+	effective := s.effectiveAt
+	if effective == "" {
+		effective = "?"
 	}
-	result := output
-	if err != nil {
-		result = map[string]any{"error": err.Error()}
+	result := out
+	if opErr != nil {
+		result = map[string]any{"output": out, "error": opErr.Error()}
 	}
-	r.seq++
-	now := time.Now().Format(time.RFC3339Nano)
-	body := fmt.Sprintf("agent:%s, func:%s(input:%s), return:%s, token:%s, response_time:%s, time:%s, effective_time:%s, session:%s, seq:%d, call_id:%d, parent_call_id:%d, phase:%s, prev_hash:%s", r.AgentName, function, safeJSON(input), safeJSON(result), tokenText, elapsed.Round(time.Millisecond), now, effectiveAt, r.SessionID, r.seq, callID, parentID, phase, r.lastHash)
+	body := fmt.Sprintf("agent:%s, func:%s(input:%s), return:%s, token:%s, response_time:%s, time:%s, effective_time:%s, session:%s, seq:%d, call_id:%d, parent_call_id:%d, phase:END, prev_hash:%s", r.AgentName, s.function, s.input, safeJSON(result), tokenText, time.Since(s.started).Round(time.Microsecond), time.Now().Format(time.RFC3339Nano), effective, r.SessionID, r.seq+1, s.callID, s.parentID, r.lastHash)
 	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(body)))
-	r.lastHash = hash
-	if _, e := r.file.WriteString("[DEBUG] " + body + ", hash:" + hash + "\n"); e != nil {
+	_, e := r.file.WriteString("[DEBUG] " + body + ", hash:" + hash + "\n")
+	if e == nil {
+		e = r.file.Sync()
+	}
+	if e != nil {
 		r.writeErr = e
 		return e
 	}
-	r.writeErr = r.file.Sync()
-	return r.writeErr
+	r.seq++
+	r.lastHash = hash
+	return nil
 }
-
-// Err exposes failures even when a nested span's deferred completion cannot return one.
-func (r *Recorder) Err() error { r.mu.Lock(); defer r.mu.Unlock(); return r.writeErr }
+func (r *Recorder) Err() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.writeErr != nil {
+		return r.writeErr
+	}
+	if r.closed {
+		return ErrClosed
+	}
+	return nil
+}
 func (r *Recorder) Close() error {
 	if r == nil {
 		return nil
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.file.Close()
+	if r.closed {
+		return r.closeErr
+	}
+	r.closing = true
+	for len(r.active) > 0 {
+		r.cond.Wait()
+	}
+	if r.closed {
+		return r.closeErr
+	}
+	e := r.writeErr
+	if e == nil {
+		_, e = r.journal.Seek(0, io.SeekStart)
+		h := sha256.New()
+		if e == nil {
+			_, e = io.Copy(h, r.journal)
+		}
+		if e == nil {
+			b, _ := json.Marshal(seal{r.seq, r.lastHash, fmt.Sprintf("%x", h.Sum(nil)), r.callSeq})
+			var f *os.File
+			f, e = os.OpenFile(r.Path+".seal", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+			if e == nil {
+				_, e = f.Write(b)
+				if e == nil {
+					e = f.Sync()
+				}
+				e = errors.Join(e, f.Close())
+			}
+		}
+	}
+	r.closeErr = errors.Join(e, r.file.Close(), r.journal.Close())
+	r.closed = true
+	r.cond.Broadcast()
+	return r.closeErr
 }
 
-// Verify checks sequence continuity and the SHA-256 chain of an audit file.
-func Verify(path string) (records int, err error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
+// Verify requires a close seal and a begin journal. For legacy files use the
+// explicitly weaker VerifyLegacy; neither mode prevents rewriting all files.
+func Verify(path string) (int, error) {
+	b, e := os.ReadFile(path + ".seal")
+	if e != nil {
+		return 0, fmt.Errorf("missing close seal: %w", e)
+	}
+	var seal seal
+	if e = json.Unmarshal(b, &seal); e != nil {
+		return 0, e
+	}
+	journal, e := os.ReadFile(path + ".journal")
+	if e != nil {
+		return 0, e
+	}
+	if fmt.Sprintf("%x", sha256.Sum256(journal)) != seal.JournalHash {
+		return 0, errors.New("journal hash mismatch")
+	}
+	expected := map[uint64]beginRecord{}
+	for _, line := range bytes.Split(bytes.TrimSpace(journal), []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		var item beginRecord
+		if e = json.Unmarshal(line, &item); e != nil {
+			return 0, e
+		}
+		if item.CallID != uint64(len(expected)+1) {
+			return 0, errors.New("journal call sequence mismatch")
+		}
+		if item.ParentID >= item.CallID {
+			return 0, errors.New("invalid parent")
+		}
+		expected[item.CallID] = item
+	}
+	n, last, seen, e := verifyLines(path, expected)
+	if e != nil {
+		return n, e
+	}
+	if uint64(n) != seal.Records || last != seal.LastHash || uint64(len(expected)) != seal.Calls || len(seen) != len(expected) {
+		return n, errors.New("incomplete session or truncated tail")
+	}
+	return n, nil
+}
+func VerifyLegacy(path string) (int, error) { n, _, _, e := verifyLines(path, nil); return n, e }
+func verifyLines(path string, expected map[uint64]beginRecord) (records int, last string, seen map[uint64]bool, err error) {
+	seen = map[uint64]bool{}
+	f, e := os.Open(path)
+	if e != nil {
+		err = e
+		return
 	}
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
-	// Historical runs may contain a large final workflow summary. New platform
-	// runs cap inline summary items, but the verifier remains backward-compatible
-	// with those immutable audit files.
 	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
-	previous := ""
-	expected := uint64(1)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "[DEBUG] ") {
-			return records, fmt.Errorf("line %d: invalid prefix", records+1)
+			err = errors.New("invalid prefix")
+			return
 		}
 		content := strings.TrimPrefix(line, "[DEBUG] ")
 		at := strings.LastIndex(content, ", hash:")
 		if at < 0 {
-			return records, fmt.Errorf("line %d: missing hash", records+1)
+			err = errors.New("missing hash")
+			return
 		}
-		body, actual := content[:at], content[at+7:]
-		calculated := fmt.Sprintf("%x", sha256.Sum256([]byte(body)))
-		if actual != calculated {
-			return records, fmt.Errorf("line %d: hash mismatch", records+1)
-		}
-		if !strings.HasSuffix(body, "prev_hash:"+previous) {
-			return records, fmt.Errorf("line %d: chain mismatch", records+1)
+		body, hash := content[:at], content[at+7:]
+		if hash != fmt.Sprintf("%x", sha256.Sum256([]byte(body))) || !strings.HasSuffix(body, "prev_hash:"+last) {
+			err = errors.New("hash chain mismatch")
+			return
 		}
 		match := sequencePattern.FindStringSubmatch(body)
 		if len(match) != 2 {
-			return records, fmt.Errorf("line %d: missing sequence", records+1)
+			err = errors.New("missing sequence")
+			return
 		}
-		seq, e := strconv.ParseUint(match[1], 10, 64)
-		if e != nil || seq != expected {
-			return records, fmt.Errorf("line %d: sequence mismatch", records+1)
+		seq, _ := strconv.ParseUint(match[1], 10, 64)
+		if seq != uint64(records+1) {
+			err = errors.New("sequence mismatch")
+			return
 		}
-		previous = actual
-		expected++
+		if expected != nil {
+			m := callPattern.FindStringSubmatch(body)
+			if len(m) != 3 {
+				err = errors.New("missing call id")
+				return
+			}
+			id, _ := strconv.ParseUint(m[1], 10, 64)
+			parent, _ := strconv.ParseUint(m[2], 10, 64)
+			begin, ok := expected[id]
+			if !ok || seen[id] || parent != begin.ParentID || !strings.Contains(body, "func:"+begin.Function+"(input:"+string(begin.Input)+"), return:") {
+				err = errors.New("call journal mismatch")
+				return
+			}
+			seen[id] = true
+		}
+		last = hash
 		records++
 	}
-	if err := scanner.Err(); err != nil {
-		return records, err
-	}
-	return records, nil
+	err = scanner.Err()
+	return
 }

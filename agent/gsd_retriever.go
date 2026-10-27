@@ -14,7 +14,13 @@ func NewGSDRetriever(k gsd.Knowledge) *LocalRetriever {
 }
 func NewGSDRetrieverContext(ctx context.Context, k gsd.Knowledge) (retriever *LocalRetriever) {
 	_, span := agentlog.Start(ctx, "agent.NewGSDRetriever", map[string]any{"schema_version": k.SchemaVersion, "sources": len(k.Sources), "cards": len(k.Cards)})
-	defer func() { span.End(map[string]any{"documents": len(retriever.Documents)}, nil, nil) }()
+	defer span.Finish(nil, func() any {
+		if retriever == nil {
+			return nil
+		}
+		return map[string]any{"documents": len(retriever.Documents)}
+	}, nil)
+	span.Require()
 	r := &LocalRetriever{}
 	for id, s := range k.Sources {
 		r.Documents = append(r.Documents, Document{ID: "source:" + id, Source: s.URI, Text: fmt.Sprintf("%s. %s", s.Kind, s.Claim)})

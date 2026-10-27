@@ -18,6 +18,12 @@ type Retriever interface {
 }
 
 func (a *Template) auditContext(ctx context.Context) (context.Context, error) {
+	a.logMu.Lock()
+	current := a.Logger
+	a.logMu.Unlock()
+	if current != nil && agentlog.FromContext(ctx) == current {
+		return ctx, nil
+	}
 	r, err := a.recorder()
 	if err != nil {
 		return ctx, err
@@ -44,6 +50,7 @@ type Template struct {
 	LogDir          string
 	Logger          *agentlog.Recorder
 	logMu           sync.Mutex
+	closed          bool
 	Model           model.Client
 	Retriever       Retriever
 	Tools           map[string]Tool
@@ -54,8 +61,14 @@ type Template struct {
 
 // BuildMessages applies the agent-level system prompt and an optional operation instruction.
 func (a *Template) BuildMessages(ctx context.Context, messages []model.Message, instruction string) (result []model.Message) {
+	var e error
+	ctx, e = a.auditContext(ctx)
+	if e != nil {
+		panic(e)
+	}
 	_, span := agentlog.Start(ctx, "agent.Template.BuildMessages", map[string]any{"system_prompt": a.SystemPrompt, "instruction": instruction, "messages": messages})
-	defer func() { span.End(result, nil, nil) }()
+	defer span.Finish(nil, func() any { return result }, nil)
+	span.Require()
 	system := strings.TrimSpace(strings.Join([]string{a.SystemPrompt, instruction}, "\n"))
 	result = append([]model.Message(nil), messages...)
 	if system != "" {
@@ -67,6 +80,9 @@ func (a *Template) BuildMessages(ctx context.Context, messages []model.Message, 
 func (a *Template) recorder() (*agentlog.Recorder, error) {
 	a.logMu.Lock()
 	defer a.logMu.Unlock()
+	if a.closed {
+		return nil, agentlog.ErrClosed
+	}
 	if a.Logger == nil {
 		r, err := agentlog.New(a.Name, a.LogDir)
 		if err != nil {
@@ -74,16 +90,20 @@ func (a *Template) recorder() (*agentlog.Recorder, error) {
 		}
 		a.Logger = r
 	}
-	return a.Logger, nil
+	return a.Logger, a.Logger.Err()
 }
 func (a *Template) Close() error {
 	a.logMu.Lock()
-	defer a.logMu.Unlock()
-	if a.Logger == nil {
+	a.closed = true
+	r := a.Logger
+	a.logMu.Unlock()
+	if r == nil {
 		return nil
 	}
-	err := a.Logger.Close()
+	err := r.Close()
+	a.logMu.Lock()
 	a.Logger = nil
+	a.logMu.Unlock()
 	return err
 }
 
@@ -93,7 +113,10 @@ func (a *Template) GetInformation(ctx context.Context, q string, k int) (docs []
 		return nil, e
 	}
 	ctx, span := agentlog.Start(ctx, "agent.Template.GetInformation", map[string]any{"query": q, "k": k})
-	defer func() { span.End(docs, nil, err) }()
+	defer span.Finish(&err, func() any { return docs }, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
 	if a.Retriever == nil {
 		return nil, errors.New("retriever not configured")
 	}
@@ -105,14 +128,16 @@ func (a *Template) Ask(ctx context.Context, q string, reasoning string) (result 
 		return graph.Result{}, e
 	}
 	ctx, span := agentlog.Start(ctx, "agent.Template.Ask", map[string]any{"question": q, "reasoning": reasoning})
-	defer func() {
-		var tok *int
+	defer span.Finish(&err, func() any { return result }, func() *int {
 		if result.State != nil && result.State["usage_known"] == true {
 			n, _ := result.State["total_tokens"].(int)
-			tok = &n
+			return &n
 		}
-		span.End(result, tok, err)
-	}()
+		return nil
+	})
+	if err = span.Err(); err != nil {
+		return
+	}
 	g := graph.NewContext(ctx)
 	if err := g.AddNodeContext(ctx, "retrieve", func(ctx context.Context, s graph.State) (graph.State, error) {
 		if a.Retriever == nil {
@@ -156,18 +181,14 @@ func (a *Template) Ask(ctx context.Context, q string, reasoning string) (result 
 	g.EdgeContext(ctx, "validate", graph.End)
 	initial := graph.State{"question": q}
 	if a.Before != nil {
-		hookCtx, hookSpan := agentlog.Start(ctx, "agent.Hook.Before", initial)
-		err := a.Before(hookCtx, initial)
-		hookSpan.End(map[string]any{"accepted": err == nil}, nil, err)
+		_, err := agentlog.Call(ctx, "agent.Hook.Before", initial, func(ctx context.Context) (bool, error) { e := a.Before(ctx, initial); return e == nil, e })
 		if err != nil {
 			return graph.Result{}, err
 		}
 	}
 	r, err := g.Run(ctx, initial)
 	if err == nil && a.After != nil {
-		hookCtx, hookSpan := agentlog.Start(ctx, "agent.Hook.After", r)
-		err = a.After(hookCtx, r)
-		hookSpan.End(map[string]any{"accepted": err == nil}, nil, err)
+		_, err = agentlog.Call(ctx, "agent.Hook.After", r, func(ctx context.Context) (bool, error) { e := a.After(ctx, r); return e == nil, e })
 	}
 	result = r
 	return result, err
@@ -178,14 +199,16 @@ func (a *Template) Chat(ctx context.Context, messages []model.Message, reasoning
 		return model.Response{}, e
 	}
 	ctx, span := agentlog.Start(ctx, "agent.Template.Chat", map[string]any{"messages": messages, "reasoning": reasoning})
-	defer func() {
-		var tok *int
+	defer span.Finish(&err, func() any { return response }, func() *int {
 		if response.UsageKnown {
 			n := response.InputTokens + response.OutputTokens
-			tok = &n
+			return &n
 		}
-		span.End(response, tok, err)
-	}()
+		return nil
+	})
+	if err = span.Err(); err != nil {
+		return
+	}
 	if a.Model == nil {
 		return model.Response{}, errors.New("model not configured")
 	}
@@ -197,15 +220,15 @@ func (a *Template) RunTool(ctx context.Context, name string, input json.RawMessa
 		return nil, e
 	}
 	ctx, span := agentlog.Start(ctx, "agent.Template.RunTool", map[string]any{"name": name, "input": input})
-	defer func() { span.End(output, nil, err) }()
+	defer span.Finish(&err, func() any { return output }, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
 	t, ok := a.Tools[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown tool %s", name)
 	}
-	toolCtx, toolSpan := agentlog.Start(ctx, "agent.Tool."+name, input)
-	output, err = t.Run(toolCtx, input)
-	toolSpan.End(output, nil, err)
-	return output, err
+	return agentlog.Call(ctx, "agent.Tool."+name, input, func(ctx context.Context) (any, error) { return t.Run(ctx, input) })
 }
 
 // Triage returns a rule-validated diagnostic suggestion from observable signals.
@@ -216,7 +239,10 @@ func (a *Template) Triage(ctx context.Context, observed gsd.Case) (prediction gs
 		return gsd.Prediction{}, e
 	}
 	ctx, span := agentlog.Start(ctx, "agent.Template.Triage", observed)
-	defer func() { span.End(prediction, nil, err) }()
+	defer span.Finish(&err, func() any { return prediction }, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
 	if err := ctx.Err(); err != nil {
 		return gsd.Prediction{}, err
 	}

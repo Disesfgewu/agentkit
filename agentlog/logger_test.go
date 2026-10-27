@@ -8,6 +8,34 @@ import (
 	"time"
 )
 
+func TestCompletionWriteFailureIsReturnedAndBlocksNextCall(t *testing.T) {
+	r, err := New("write-failure", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithRecorder(context.Background(), r)
+	_, err = Call(ctx, "operation", nil, func(context.Context) (int, error) {
+		if e := r.file.Close(); e != nil {
+			t.Fatal(e)
+		}
+		return 42, nil
+	})
+	if err == nil {
+		t.Fatal("lost completion reported success")
+	}
+	called := false
+	_, err = Call(ctx, "next", nil, func(context.Context) (int, error) { called = true; return 0, nil })
+	if err == nil || called {
+		t.Fatal("operation executed after audit write failure")
+	}
+	if r.Close() == nil {
+		t.Fatal("close hid audit failure")
+	}
+	if _, err := Verify(r.Path); err == nil {
+		t.Fatal("incomplete session verified")
+	}
+}
+
 func TestRedaction(t *testing.T) {
 	r, err := New("test", t.TempDir())
 	if err != nil {

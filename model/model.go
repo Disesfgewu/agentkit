@@ -65,7 +65,10 @@ func New(c Config) (*HTTPClient, error) {
 }
 func NewContext(ctx context.Context, c Config) (client *HTTPClient, err error) {
 	_, span := agentlog.Start(ctx, "model.New", c)
-	defer func() { span.End(client, nil, err) }()
+	defer span.Finish(&err, func() any { return map[string]any{"created": client != nil, "config": c} }, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
 	if c.Model == "" || c.BaseURL == "" {
 		return nil, errors.New("model and base_url required")
 	}
@@ -81,14 +84,16 @@ func NewContext(ctx context.Context, c Config) (client *HTTPClient, err error) {
 }
 func (c *HTTPClient) Chat(ctx context.Context, r Request) (response Response, err error) {
 	ctx, span := agentlog.Start(ctx, "model.HTTPClient.Chat", map[string]any{"provider": c.Config.Name, "protocol": c.Config.Protocol, "model": c.Config.Model, "request": r})
-	defer func() {
-		var tokens *int
+	defer span.Finish(&err, func() any { return response }, func() *int {
 		if response.UsageKnown {
 			n := response.InputTokens + response.OutputTokens
-			tokens = &n
+			return &n
 		}
-		span.End(response, tokens, err)
-	}()
+		return nil
+	})
+	if err = span.Err(); err != nil {
+		return
+	}
 	if len(r.Messages) == 0 {
 		return Response{}, errors.New("messages required")
 	}
@@ -147,7 +152,12 @@ func (c *HTTPClient) Chat(ctx context.Context, r Request) (response Response, er
 	}
 }
 
-func (c *HTTPClient) awaitRate(ctx context.Context) error {
+func (c *HTTPClient) awaitRate(ctx context.Context) (err error) {
+	_, span := agentlog.Start(ctx, "model.HTTPClient.awaitRate", map[string]any{"rpm": c.Config.RequestsPerMinute})
+	defer span.Finish(&err, func() any { return map[string]any{"ready": err == nil} }, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
 	if c.Config.RequestsPerMinute <= 0 {
 		return nil
 	}
@@ -171,9 +181,12 @@ func (c *HTTPClient) awaitRate(ctx context.Context) error {
 
 func (c *HTTPClient) doRequest(ctx context.Context, client *http.Client, u string, body []byte, headers map[string]string, key string, attempt int) (raw []byte, status int, retryAfter time.Duration, err error) {
 	ctx, span := agentlog.Start(ctx, "model.HTTPClient.doRequest", map[string]any{"provider": c.Config.Name, "attempt": attempt})
-	defer func() {
-		span.End(map[string]any{"status": status, "response_bytes": len(raw), "retry_after_ms": retryAfter.Milliseconds()}, nil, err)
-	}()
+	defer span.Finish(&err, func() any {
+		return map[string]any{"status": status, "response_bytes": len(raw), "retry_after_ms": retryAfter.Milliseconds()}
+	}, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", u, bytes.NewReader(body))
 	if err != nil {
 		return nil, 0, 0, err
@@ -212,7 +225,10 @@ func (c *HTTPClient) doRequest(ctx context.Context, client *http.Client, u strin
 }
 func (c *HTTPClient) payload(ctx context.Context, r Request) (body map[string]any, path string, headers map[string]string, err error) {
 	_, span := agentlog.Start(ctx, "model.HTTPClient.payload", map[string]any{"protocol": c.Config.Protocol, "model": c.Config.Model, "request": r})
-	defer func() { span.End(map[string]any{"body": body, "path": path, "headers": headers}, nil, err) }()
+	defer span.Finish(&err, func() any { return map[string]any{"body": body, "path": path, "headers": headers} }, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
 	p := c.Config.Protocol
 	m := map[string]any{"model": c.Config.Model}
 	h := map[string]string{}
@@ -364,14 +380,16 @@ func (c *HTTPClient) payload(ctx context.Context, r Request) (body map[string]an
 }
 func (c *HTTPClient) parse(ctx context.Context, raw []byte) (out Response, err error) {
 	_, span := agentlog.Start(ctx, "model.HTTPClient.parse", map[string]any{"protocol": c.Config.Protocol, "response_bytes": len(raw)})
-	defer func() {
-		var tokens *int
+	defer span.Finish(&err, func() any { return out }, func() *int {
 		if out.UsageKnown {
 			n := out.InputTokens + out.OutputTokens
-			tokens = &n
+			return &n
 		}
-		span.End(out, tokens, err)
-	}()
+		return nil
+	})
+	if err = span.Err(); err != nil {
+		return
+	}
 	var v map[string]any
 	if err := json.Unmarshal(raw, &v); err != nil {
 		return Response{}, err

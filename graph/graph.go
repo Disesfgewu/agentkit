@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"github.com/Disesfgewu/GSD_Survey/agent-template-client/agentlog"
 	"maps"
-	"sort"
 	"sync"
 )
 
@@ -45,7 +44,13 @@ type Graph struct {
 func New() *Graph { return NewContext(context.Background()) }
 func NewContext(ctx context.Context) (g *Graph) {
 	_, span := agentlog.Start(ctx, "graph.New", nil)
-	defer func() { span.End(map[string]any{"max_steps": g.MaxSteps}, nil, nil) }()
+	defer span.Finish(nil, func() any {
+		if g == nil {
+			return nil
+		}
+		return map[string]any{"max_steps": g.MaxSteps}
+	}, nil)
+	span.Require()
 	return &Graph{nodes: map[string]Node{}, edges: map[string]edge{}, MaxSteps: 32, RetainPatches: true}
 }
 func (g *Graph) AddNode(name string, fn Node) error {
@@ -53,7 +58,10 @@ func (g *Graph) AddNode(name string, fn Node) error {
 }
 func (g *Graph) AddNodeContext(ctx context.Context, name string, fn Node) (err error) {
 	_, span := agentlog.Start(ctx, "graph.Graph.AddNode", map[string]any{"name": name})
-	defer func() { span.End(map[string]any{"registered": err == nil}, nil, err) }()
+	defer span.Finish(&err, func() any { return map[string]any{"registered": err == nil} }, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
 	if name == Start || name == End || name == "" || fn == nil {
 		return errors.New("invalid node")
 	}
@@ -66,7 +74,8 @@ func (g *Graph) AddNodeContext(ctx context.Context, name string, fn Node) (err e
 func (g *Graph) Edge(from, to string) { g.EdgeContext(context.Background(), from, to) }
 func (g *Graph) EdgeContext(ctx context.Context, from, to string) {
 	_, span := agentlog.Start(ctx, "graph.Graph.Edge", map[string]any{"from": from, "to": to})
-	defer span.End(map[string]any{"registered": true}, nil, nil)
+	defer span.Finish(nil, func() any { return map[string]any{"registered": true} }, nil)
+	span.Require()
 	g.edges[from] = edge{to: to}
 }
 func (g *Graph) Conditional(from string, route Router, choices map[string]string) {
@@ -74,7 +83,8 @@ func (g *Graph) Conditional(from string, route Router, choices map[string]string
 }
 func (g *Graph) ConditionalContext(ctx context.Context, from string, route Router, choices map[string]string) {
 	_, span := agentlog.Start(ctx, "graph.Graph.Conditional", map[string]any{"from": from, "choices": choices})
-	defer span.End(map[string]any{"registered": true}, nil, nil)
+	defer span.Finish(nil, func() any { return map[string]any{"registered": true} }, nil)
+	span.Require()
 	g.edges[from] = edge{route: route, allowed: maps.Clone(choices)}
 }
 func (g *Graph) Compile() error {
@@ -82,7 +92,10 @@ func (g *Graph) Compile() error {
 }
 func (g *Graph) compile(ctx context.Context) (err error) {
 	_, span := agentlog.Start(ctx, "graph.Graph.Compile", map[string]any{"nodes": len(g.nodes), "edges": len(g.edges), "max_steps": g.MaxSteps})
-	defer func() { span.End(map[string]any{"valid": err == nil}, nil, err) }()
+	defer span.Finish(&err, func() any { return map[string]any{"valid": err == nil} }, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
 	if g.MaxSteps < 1 {
 		return errors.New("MaxSteps must be positive")
 	}
@@ -126,17 +139,26 @@ func cloneContext(_ context.Context, s State) (result State) {
 }
 func (g *Graph) Run(ctx context.Context, initial State) (result Result, err error) {
 	ctx, span := agentlog.Start(ctx, "graph.Graph.Run", stateSummary(initial))
-	defer func() { span.End(resultSummary(result), nil, err) }()
+	defer span.Finish(&err, func() any { return resultSummary(result) }, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
 	return g.RunFrom(ctx, initial, Start, nil)
 }
 func (g *Graph) RunFrom(ctx context.Context, initial State, from string, history []Step) (result Result, err error) {
 	ctx, span := agentlog.Start(ctx, "graph.Graph.RunFrom", map[string]any{"initial": stateSummary(initial), "from": from, "history_steps": len(history)})
-	defer func() { span.End(resultSummary(result), nil, err) }()
+	defer span.Finish(&err, func() any { return resultSummary(result) }, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
 	return g.run(ctx, initial, from, history, nil)
 }
 func (g *Graph) run(ctx context.Context, initial State, from string, history []Step, onCommit func(Checkpoint) error) (result Result, err error) {
 	ctx, span := agentlog.Start(ctx, "graph.Graph.run", map[string]any{"initial": stateSummary(initial), "from": from, "history_steps": len(history), "checkpointed": onCommit != nil})
-	defer func() { span.End(resultSummary(result), nil, err) }()
+	defer span.Finish(&err, func() any { return resultSummary(result) }, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
 	if err := g.compile(ctx); err != nil {
 		return Result{}, err
 	}
@@ -154,11 +176,7 @@ func (g *Graph) run(ctx context.Context, initial State, from string, history []S
 		next := e.to
 		route := ""
 		if e.route != nil {
-			routeCtx, routeSpan := agentlog.Start(ctx, "graph.Router."+current, stateSummary(s))
-			var err error
-			route, err = e.route(cloneContext(routeCtx, s))
-			_ = routeCtx
-			routeSpan.End(map[string]any{"route": route}, nil, err)
+			route, err = agentlog.Call(ctx, "graph.Router."+current, s, func(callCtx context.Context) (string, error) { return e.route(cloneContext(callCtx, s)) })
 			if err != nil {
 				return Result{State: s, Steps: steps}, err
 			}
@@ -169,19 +187,17 @@ func (g *Graph) run(ctx context.Context, initial State, from string, history []S
 		}
 		if next == End {
 			if onCommit != nil {
-				commitCtx, commitSpan := agentlog.Start(ctx, "graph.Store.Save", map[string]any{"last_node": End, "steps": len(steps)})
-				err := onCommit(Checkpoint{State: s, Steps: steps, LastNode: End})
-				_ = commitCtx
-				commitSpan.End(map[string]any{"saved": err == nil}, nil, err)
+				_, err := agentlog.Call(ctx, "graph.Store.Save", Checkpoint{State: s, Steps: steps, LastNode: End}, func(context.Context) (bool, error) {
+					e := onCommit(Checkpoint{State: s, Steps: steps, LastNode: End})
+					return e == nil, e
+				})
 				if err != nil {
 					return Result{State: s, Steps: steps}, err
 				}
 			}
 			return Result{State: s, Steps: steps, Finished: true}, nil
 		}
-		nodeCtx, nodeSpan := agentlog.Start(ctx, "graph.Node."+next, stateSummary(s))
-		patch, err := g.nodes[next](nodeCtx, cloneContext(nodeCtx, s))
-		nodeSpan.End(patch, nil, err)
+		patch, err := agentlog.Call(ctx, "graph.Node."+next, s, func(callCtx context.Context) (State, error) { return g.nodes[next](callCtx, cloneContext(callCtx, s)) })
 		if err != nil {
 			return Result{State: s, Steps: steps}, fmt.Errorf("node %s: %w", next, err)
 		}
@@ -195,10 +211,10 @@ func (g *Graph) run(ctx context.Context, initial State, from string, history []S
 		steps = append(steps, step)
 		current = next
 		if onCommit != nil {
-			commitCtx, commitSpan := agentlog.Start(ctx, "graph.Store.Save", map[string]any{"last_node": current, "steps": len(steps)})
-			err := onCommit(Checkpoint{State: s, Steps: steps, LastNode: current})
-			_ = commitCtx
-			commitSpan.End(map[string]any{"saved": err == nil}, nil, err)
+			_, err := agentlog.Call(ctx, "graph.Store.Save", Checkpoint{State: s, Steps: steps, LastNode: current}, func(context.Context) (bool, error) {
+				e := onCommit(Checkpoint{State: s, Steps: steps, LastNode: current})
+				return e == nil, e
+			})
 			if err != nil {
 				return Result{State: s, Steps: steps}, err
 			}
@@ -207,23 +223,9 @@ func (g *Graph) run(ctx context.Context, initial State, from string, history []S
 	return Result{State: s, Steps: steps}, fmt.Errorf("graph exceeded %d steps", g.MaxSteps)
 }
 
-func stateSummary(s State) map[string]any {
-	keys := make([]string, 0, len(s))
-	for key := range s {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	summary := map[string]any{"keys": keys, "key_count": len(keys)}
-	for _, key := range []string{"record_id", "document_count", "retrieval_attempts", "source_valid", "processed", "has_new_data", "decision_mode"} {
-		if value, ok := s[key]; ok {
-			summary[key] = value
-		}
-	}
-	return summary
-}
-
-func resultSummary(result Result) map[string]any {
-	return map[string]any{"finished": result.Finished, "step_count": len(result.Steps), "state": stateSummary(result.State)}
+func stateSummary(s State) map[string]any { return maps.Clone(s) }
+func resultSummary(r Result) map[string]any {
+	return map[string]any{"finished": r.Finished, "steps": r.Steps, "state": r.State}
 }
 
 type Checkpoint struct {
@@ -239,14 +241,24 @@ type Store interface {
 // RunCheckpointed resumes after the last committed node for a thread.
 func (g *Graph) RunCheckpointed(ctx context.Context, threadID string, initial State, store Store) (result Result, err error) {
 	ctx, span := agentlog.Start(ctx, "graph.Graph.RunCheckpointed", map[string]any{"thread_id": threadID, "initial": initial})
-	defer func() { span.End(result, nil, err) }()
+	defer span.Finish(&err, func() any { return result }, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
 	if store == nil {
 		return Result{}, errors.New("checkpoint store required")
 	}
-	loadCtx, loadSpan := agentlog.Start(ctx, "graph.Store.Load", map[string]any{"thread_id": threadID})
-	checkpoint, found, err := store.Load(threadID)
-	_ = loadCtx
-	loadSpan.End(map[string]any{"checkpoint": checkpoint, "found": found}, nil, err)
+	loaded, e := agentlog.Call(ctx, "graph.Store.Load", map[string]any{"thread_id": threadID}, func(context.Context) (struct {
+		Value Checkpoint
+		Found bool
+	}, error) {
+		c, ok, e := store.Load(threadID)
+		return struct {
+			Value Checkpoint
+			Found bool
+		}{c, ok}, e
+	})
+	checkpoint, found, err := loaded.Value, loaded.Found, e
 	if err != nil {
 		return Result{}, err
 	}

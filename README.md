@@ -1,6 +1,6 @@
 # GSD traceable agent template client
 
-**Audit review status (2026-10-27): not ready for complete-audit acceptance.** Thirteen fault-injection cases reproduce silent audit loss, lifecycle/ownership defects, missing panic records and incomplete inputs/outputs. Earlier successful live runs verify only their exercised paths. See the [engineering review and reproduction commands](../docs/fleet-http/07_AUTOLOGGER_REVIEW.md). Production fixes are still outstanding.
+**Audit review update (2026-10-27):** The 13 reproduced defects now have passing regression tests. A real-call rerun and strict verification are documented in [PR review fixes](../docs/fleet-http/08_PR_REVIEW_FIXES.md). Coverage and lifecycle limits are explicit; this is not a claim that every arbitrary Go function is intercepted.
 
 The existing `agent.Template` owns automatic logging. Use `template.Runtime()` for HTTP/custom operations; it reuses `Template.recorder()` and the same logger as `Template.Chat`. `Runtime.JSON` records HTTP calls automatically; `Runtime.Execute` runs custom operations with one completion and nested call IDs. Applications do not call `Recorder.Record`. `NewRuntime` is only a convenience constructor delegating to Template; it does not implement a separate logging system. An empty logDir defaults to `log/`. See the [real-call rerun and audit reconciliation](../docs/fleet-http/06_PACKAGE_AUTOLOG.md).
 
@@ -85,3 +85,10 @@ go run ./cmd/dsexportcsv -data runs/agent_preview -split test -out runs/agent_pr
 ```
 
 The measured preview export contains 1,125,900 raw numeric rows in `raw_values.csv`, plus complete feature, event, truth, and frame-metadata CSV files.
+# Audit lifecycle update (2026-10-27)
+
+`agent.Template` owns its automatic logger. Obtain `Runtime()` to propagate its context to application callbacks; use `Runtime.Execute` for additional functions. Call `Template.Close` or the owning runtime's `Close` after work completes. Borrowed runtimes cannot close their owner, and a closed template cannot be reopened. Do not replace the public compatibility `Logger` field while work is running.
+
+Wrapped standalone operations without a recorder now create a short-lived session under `log/`. One `.log` END record is emitted per call ID; `.log.journal` retains durable BEGIN snapshots, and `.log.seal` records orderly completion. Keep all three files. `agentlog.Verify` requires the complete set; `VerifyLegacy` only checks historical hash chains. Audit failures propagate as errors (or panic for legacy methods without an error return). Close waits for active calls and must be invoked outside those calls. Arbitrary external Go functions are not intercepted automatically: wrap their execution to join the audit trail.
+
+Regression results, actual LLM scores, limitations and local evidence paths: [PR review fixes](../docs/fleet-http/08_PR_REVIEW_FIXES.md).

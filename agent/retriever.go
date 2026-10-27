@@ -19,7 +19,10 @@ func LoadMarkdown(paths []string) (*LocalRetriever, error) {
 }
 func LoadMarkdownContext(ctx context.Context, paths []string) (retriever *LocalRetriever, err error) {
 	_, span := agentlog.Start(ctx, "agent.LoadMarkdown", paths)
-	defer func() { span.End(retriever, nil, err) }()
+	defer span.Finish(&err, func() any { return retriever }, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
 	r := &LocalRetriever{}
 	for _, path := range paths {
 		b, err := os.ReadFile(path)
@@ -52,12 +55,16 @@ func LoadMarkdownContext(ctx context.Context, paths []string) (retriever *LocalR
 }
 func tokens(ctx context.Context, s string) (result []string) {
 	_, span := agentlog.Start(ctx, "agent.tokens", s)
-	defer func() { span.End(result, nil, nil) }()
+	defer span.Finish(nil, func() any { return result }, nil)
+	span.Require()
 	return strings.FieldsFunc(strings.ToLower(s), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' })
 }
 func (r *LocalRetriever) Retrieve(ctx context.Context, q string, k int) (documents []Document, err error) {
 	ctx, span := agentlog.Start(ctx, "agent.LocalRetriever.Retrieve", map[string]any{"query": q, "k": k, "document_count": len(r.Documents)})
-	defer func() { span.End(documents, nil, err) }()
+	defer span.Finish(&err, func() any { return documents }, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
 	if k <= 0 {
 		return nil, nil
 	}

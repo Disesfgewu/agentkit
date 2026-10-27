@@ -41,13 +41,10 @@ func (r *Runtime) Context(ctx context.Context) context.Context {
 }
 func (r *Runtime) Path() string { return r.recorder.Path }
 func (r *Runtime) Close() error {
-	var closeErr error
-	if r.owner != nil {
-		closeErr = r.owner.Close()
-	} else {
-		closeErr = r.recorder.Close()
+	if r.owner == nil {
+		return errors.New("borrowed runtime cannot close its owner")
 	}
-	err := errors.Join(r.recorder.Err(), closeErr)
+	err := r.owner.Close()
 	if err != nil {
 		return err
 	}
@@ -57,20 +54,7 @@ func (r *Runtime) Close() error {
 
 // Execute is the extension operation boundary: one completion, including errors/panics.
 func (r *Runtime) Execute(ctx context.Context, name string, input any, fn func(context.Context) (any, error)) (output any, err error) {
-	ctx, span := agentlog.Start(r.Context(ctx), name, input)
-	defer func() {
-		if p := recover(); p != nil {
-			err = fmt.Errorf("operation panic: %v", p)
-			span.End(output, nil, err)
-			panic(p)
-		}
-		span.End(output, nil, err)
-		err = errors.Join(err, r.recorder.Err())
-	}()
-	if err = r.recorder.Err(); err != nil {
-		return nil, err
-	}
-	return fn(ctx)
+	return agentlog.Call(r.Context(ctx), name, input, fn)
 }
 
 // JSON automatically records HTTP input/output and errors; callers never Record.
