@@ -1,6 +1,6 @@
 # GSD traceable agent template client
 
-Package-owned audit operations are available through `agent.NewRuntime(name, logDir)`. `Runtime.JSON` records HTTP calls automatically; `Runtime.Execute` runs custom operations with one completion record and nested call IDs. `Runtime.Context` shares the session with model calls, and `Close` checks write errors and verifies the audit chain. Applications do not need to call `Recorder.Record`. An empty logDir defaults to `log/`. See the [real-call rerun and audit reconciliation](../docs/fleet-http/06_PACKAGE_AUTOLOG.md).
+The existing `agent.Template` owns automatic logging. Use `template.Runtime()` for HTTP/custom operations; it reuses `Template.recorder()` and the same logger as `Template.Chat`. `Runtime.JSON` records HTTP calls automatically; `Runtime.Execute` runs custom operations with one completion and nested call IDs. Applications do not call `Recorder.Record`. `NewRuntime` is only a convenience constructor delegating to Template; it does not implement a separate logging system. An empty logDir defaults to `log/`. See the [real-call rerun and audit reconciliation](../docs/fleet-http/06_PACKAGE_AUTOLOG.md).
 
 A Go package for evidence retrieval, model calls, conditional state graphs, and replay of the existing GSD diagnostic validation set. This is a LangGraph-inspired Go runtime, not an official Go port of LangGraph. The optional [Python node bridge](examples/langgraph_node.py) runs the Go client inside a Python LangGraph workflow.
 

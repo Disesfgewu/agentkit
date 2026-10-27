@@ -11,8 +11,11 @@ import (
 	"net/http"
 )
 
-// Runtime owns the audit session. Application code calls operations, not logger APIs.
-type Runtime struct{ recorder *agentlog.Recorder }
+// Runtime is an operation facade over the existing Template-owned audit session.
+type Runtime struct {
+	recorder *agentlog.Recorder
+	owner    *Template
+}
 
 func RuntimeFromContext(ctx context.Context) (*Runtime, error) {
 	r := agentlog.FromContext(ctx)
@@ -22,18 +25,29 @@ func RuntimeFromContext(ctx context.Context) (*Runtime, error) {
 	return &Runtime{recorder: r}, nil
 }
 func NewRuntime(name, directory string) (*Runtime, error) {
-	r, e := agentlog.New(name, directory)
+	return (&Template{Name: name, LogDir: directory}).Runtime()
+}
+
+// Runtime reuses Template.recorder; it never creates a second logger/session.
+func (a *Template) Runtime() (*Runtime, error) {
+	r, e := a.recorder()
 	if e != nil {
 		return nil, e
 	}
-	return &Runtime{recorder: r}, nil
+	return &Runtime{recorder: r, owner: a}, nil
 }
 func (r *Runtime) Context(ctx context.Context) context.Context {
 	return agentlog.WithRecorder(ctx, r.recorder)
 }
 func (r *Runtime) Path() string { return r.recorder.Path }
 func (r *Runtime) Close() error {
-	err := errors.Join(r.recorder.Err(), r.recorder.Close())
+	var closeErr error
+	if r.owner != nil {
+		closeErr = r.owner.Close()
+	} else {
+		closeErr = r.recorder.Close()
+	}
+	err := errors.Join(r.recorder.Err(), closeErr)
 	if err != nil {
 		return err
 	}

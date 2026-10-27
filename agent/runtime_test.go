@@ -59,3 +59,34 @@ func TestRuntimeReportsAuditWriteFailure(t *testing.T) {
 		t.Fatal("operation continued after audit failure")
 	}
 }
+
+func TestRuntimeSharesExistingTemplateLogger(t *testing.T) {
+	a := &Template{Name: "existing-template", LogDir: t.TempDir()}
+	r, e := a.Runtime()
+	if e != nil {
+		t.Fatal(e)
+	}
+	again, e := a.Runtime()
+	if e != nil {
+		t.Fatal(e)
+	}
+	if a.Logger != r.recorder || r.recorder != again.recorder || r.Path() != again.Path() {
+		t.Fatal("separate logger created")
+	}
+	// Existing Template method and extension operation must share exactly one file.
+	_, _ = a.GetInformation(context.Background(), "test", 1)
+	_, e = r.Execute(context.Background(), "extension", nil, func(context.Context) (any, error) { return "ok", nil })
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = r.Close(); e != nil {
+		t.Fatal(e)
+	}
+	if a.Logger != nil {
+		t.Fatal("Template lifecycle not used")
+	}
+	n, e := agentlog.Verify(r.Path())
+	if e != nil || n != 2 {
+		t.Fatalf("records=%d err=%v", n, e)
+	}
+}
