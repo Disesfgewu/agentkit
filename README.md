@@ -1,5 +1,7 @@
 # GSD traceable agent template client
 
+**Audit review status (2026-10-27): not ready for complete-audit acceptance.** Thirteen fault-injection cases reproduce silent audit loss, lifecycle/ownership defects, missing panic records and incomplete inputs/outputs. Earlier successful live runs verify only their exercised paths. See the [engineering review and reproduction commands](../docs/fleet-http/07_AUTOLOGGER_REVIEW.md). Production fixes are still outstanding.
+
 The existing `agent.Template` owns automatic logging. Use `template.Runtime()` for HTTP/custom operations; it reuses `Template.recorder()` and the same logger as `Template.Chat`. `Runtime.JSON` records HTTP calls automatically; `Runtime.Execute` runs custom operations with one completion and nested call IDs. Applications do not call `Recorder.Record`. `NewRuntime` is only a convenience constructor delegating to Template; it does not implement a separate logging system. An empty logDir defaults to `log/`. See the [real-call rerun and audit reconciliation](../docs/fleet-http/06_PACKAGE_AUTOLOG.md).
 
 A Go package for evidence retrieval, model calls, conditional state graphs, and replay of the existing GSD diagnostic validation set. This is a LangGraph-inspired Go runtime, not an official Go port of LangGraph. The optional [Python node bridge](examples/langgraph_node.py) runs the Go client inside a Python LangGraph workflow.
