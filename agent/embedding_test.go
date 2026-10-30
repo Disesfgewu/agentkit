@@ -130,7 +130,7 @@ func TestNewComposesIndependentParts(t *testing.T) {
 	var a Agent = New(Config{
 		Name:      "rag",
 		LogDir:    t.TempDir(),
-		Chat:      NewChatAgent(answerModel{"Three days. See ship."}, "Be brief."),
+		Chat:      NewChatAgent(answerModel{"Three days. See [ship]."}, "Be brief."),
 		Retriever: NewEmbeddingAgent(&wordEmbedder{model: "m1"}, nil),
 		Tools:     tools,
 	})
@@ -180,7 +180,7 @@ type recordingChatter struct{ messages []model.Message }
 
 func (r *recordingChatter) Chat(_ context.Context, messages []model.Message, _ string) (model.Response, error) {
 	r.messages = messages
-	return model.Response{Text: "See a."}, nil
+	return model.Response{Text: "See [a]."}, nil
 }
 
 type fixedRetriever struct{}

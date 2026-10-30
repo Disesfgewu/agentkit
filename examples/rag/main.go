@@ -41,7 +41,7 @@ func (hashEmbedder) Embed(_ context.Context, r model.EmbeddingRequest) (model.Em
 // scriptedChat answers by citing the first document Ask placed in the system prompt.
 type scriptedChat struct{}
 
-var citation = regexp.MustCompile(`\[([^\]]+)\]`)
+var citation = regexp.MustCompile(`(?m)^\[([^\]]+)\] `)
 
 func (scriptedChat) Chat(_ context.Context, r model.Request) (model.Response, error) {
 	text := "Insufficient evidence."

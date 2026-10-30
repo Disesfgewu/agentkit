@@ -97,7 +97,7 @@ func TestAskCitationTrace(t *testing.T) {
 func TestFullAuditCallTree(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"card:K-VALVE"}}],"usage":{"prompt_tokens":4,"completion_tokens":2}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"[card:K-VALVE]"}}],"usage":{"prompt_tokens":4,"completion_tokens":2}}`))
 	}))
 	defer server.Close()
 	client, err := model.New(model.Config{Name: "mock", Protocol: "openai_chat", BaseURL: server.URL, Model: "test"})
