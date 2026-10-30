@@ -8,6 +8,11 @@ import (
 	"sort"
 )
 
+var (
+	ErrUnknownModel    = errors.New("unknown model")
+	ErrNoEligibleModel = errors.New("no eligible model")
+)
+
 type Entry struct {
 	Config Config
 	Client Client
@@ -26,7 +31,15 @@ func (r Router) Chat(ctx context.Context, req Request) (response Response, err e
 	if err = span.Err(); err != nil {
 		return
 	}
-	entries := append([]Entry(nil), r.Entries...)
+	var entries []Entry
+	for _, e := range r.Entries {
+		if req.Model == "" || e.Config.Name == req.Model {
+			entries = append(entries, e)
+		}
+	}
+	if req.Model != "" && len(entries) == 0 {
+		return Response{}, fmt.Errorf("%w %q", ErrUnknownModel, req.Model)
+	}
 	sort.SliceStable(entries, func(i, j int) bool { return entries[i].Config.Tier < entries[j].Config.Tier })
 	estimated := 0
 	for _, m := range req.Messages {
@@ -50,7 +63,7 @@ func (r Router) Chat(ctx context.Context, req Request) (response Response, err e
 		}
 	}
 	if len(failures) == 0 {
-		return Response{}, errors.New("no eligible model")
+		return Response{}, ErrNoEligibleModel
 	}
 	return Response{}, errors.Join(failures...)
 }

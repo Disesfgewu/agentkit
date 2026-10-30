@@ -25,6 +25,9 @@ type Request struct {
 	Messages        []Message `json:"messages"`
 	Reasoning       string    `json:"reasoning,omitempty"`
 	MaxOutputTokens int       `json:"max_output_tokens,omitempty"`
+	// Model pins a Router entry by name and disables failover. Empty lets the
+	// Router choose by tier.
+	Model string `json:"model,omitempty"`
 }
 type Response struct {
 	Text         string `json:"text"`
@@ -33,7 +36,7 @@ type Response struct {
 	Provider     string `json:"provider"`
 	InputTokens  int    `json:"input_tokens,omitempty"`
 	OutputTokens int    `json:"output_tokens,omitempty"`
-	UsageKnown   bool   `json:"-"`
+	UsageKnown   bool   `json:"usage_known,omitempty"`
 	Attempts     int    `json:"attempts,omitempty"`
 }
 type Client interface {

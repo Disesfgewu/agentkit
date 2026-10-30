@@ -30,3 +30,14 @@ func TestRouterFailoverAndContextFit(t *testing.T) {
 		t.Fatalf("failover %+v %v %d/%d", out, err, a, b)
 	}
 }
+func TestRouterPinDisablesFailover(t *testing.T) {
+	a, b := 0, 0
+	r := Router{Entries: []Entry{{Config: Config{Name: "a"}, Client: stubClient{err: errors.New("unavailable"), calls: &a}}, {Config: Config{Name: "b"}, Client: stubClient{response: Response{Text: "backup"}, calls: &b}}}}
+	messages := []Message{{Role: "user", Content: "x"}}
+	if _, err := r.Chat(context.Background(), Request{Messages: messages, Model: "a"}); err == nil || a != 1 || b != 0 {
+		t.Fatalf("pinned entry must not fail over: %v %d/%d", err, a, b)
+	}
+	if _, err := r.Chat(context.Background(), Request{Messages: messages, Model: "missing"}); !errors.Is(err, ErrUnknownModel) {
+		t.Fatalf("unknown pin: %v", err)
+	}
+}

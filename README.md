@@ -85,6 +85,29 @@ go run ./cmd/dsexportcsv -data runs/agent_preview -split test -out runs/agent_pr
 ```
 
 The measured preview export contains 1,125,900 raw numeric rows in `raw_values.csv`, plus complete feature, event, truth, and frame-metadata CSV files.
+
+## LLMRouter service
+
+`cmd/llmrouter` serves `model.Router` over HTTP so agents share one quota, one set of provider credentials, and one failover policy. Agents use `model.RemoteClient`, which implements `model.Client`, so graph nodes do not change.
+
+```powershell
+go run ./cmd/llmrouter -config models.example.json -env .env -addr 127.0.0.1:8787
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /v1/chat` | Body is `model.Request`, reply is `model.Response` with the provider and model actually used |
+| `GET /v1/models` | Lists loaded models without endpoints or credential names |
+| `GET /healthz` | Liveness, no token required |
+
+- Models whose environment is unset are skipped and printed at startup. Set `requests_per_minute` and `max_retries` per model in the configuration file; the limit is shared by every agent.
+- Set `model` in the request (or `ROUTER_MODEL`) to pin one entry by name. A pinned request never fails over; use this for experiments whose results must stay comparable.
+- A non-loopback `-addr` requires a bearer token in `LLMROUTER_TOKEN`.
+- `-request-timeout` bounds retries and failover per request and must stay below `model.RemoteTimeout`.
+- The router writes its own hash-chained audit log under `-log-dir`. It does not yet share call IDs with the calling agent's log.
+
+`ai-agent-platform` connects with `-provider router` and `ROUTER_BASE_URL`, optional `ROUTER_API_KEY`, and optional `ROUTER_MODEL`. Its `-llm-retries`, `-rpm`, and `-reasoning-mode` flags do not apply to this provider because the router configuration owns them.
+
 # Audit lifecycle update (2026-10-27)
 
 `agent.Template` owns its automatic logger. Obtain `Runtime()` to propagate its context to application callbacks; use `Runtime.Execute` for additional functions. Call `Template.Close` or the owning runtime's `Close` after work completes. Borrowed runtimes cannot close their owner, and a closed template cannot be reopened. Do not replace the public compatibility `Logger` field while work is running.
