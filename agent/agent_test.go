@@ -64,7 +64,7 @@ func TestAutomaticLogger(t *testing.T) {
 type citedModel struct{}
 
 func (citedModel) Chat(_ context.Context, _ model.Request) (model.Response, error) {
-	return model.Response{Text: "POLICY-7 covers refunds. See doc:guide.", Model: "fake", Provider: "mock"}, nil
+	return model.Response{Text: "POLICY-7 covers refunds. See [doc:guide].", Model: "fake", Provider: "mock"}, nil
 }
 func TestAskCitationTrace(t *testing.T) {
 	ask := func(a *Template, id string) any {
@@ -78,10 +78,13 @@ func TestAskCitationTrace(t *testing.T) {
 		return r.State["citation_valid"]
 	}
 	if ask(&Template{}, "doc:guide") != true {
-		t.Error("literal document ID should count as a citation")
+		t.Error("bracketed document ID should count as a citation")
 	}
 	if ask(&Template{}, "doc:other") != false {
 		t.Error("uncited document should not count")
+	}
+	if ask(&Template{}, "POLICY-7") != false {
+		t.Error("mentioning an ID without brackets should not count")
 	}
 	alias := func(d Document, answer string) bool {
 		return strings.Contains(answer, strings.TrimPrefix(d.ID, "card:"))

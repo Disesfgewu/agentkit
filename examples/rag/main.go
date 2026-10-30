@@ -58,12 +58,14 @@ type result struct {
 	Documents []agent.Document `json:"documents"`
 }
 
-func run(ctx context.Context, chat model.Client, embedder model.Embedder, question, logDir string) (result, error) {
+func run(ctx context.Context, chat model.Client, embedder model.Embedder, question, logDir string, minScore float64) (result, error) {
+	retriever := agent.NewEmbeddingAgent(embedder, nil)
+	retriever.MinScore = minScore
 	a := agent.New(agent.Config{
 		Name:      "handbook",
 		LogDir:    logDir,
 		Chat:      &agent.ChatAgent{Client: chat, SystemPrompt: "Answer only from the supplied evidence.", MaxOutputTokens: 2048},
-		Retriever: agent.NewEmbeddingAgent(embedder, nil),
+		Retriever: retriever,
 	})
 	defer a.Close()
 	if err := a.Ingest(ctx, handbook...); err != nil {
@@ -85,6 +87,7 @@ func main() {
 	chatModel := flag.String("chat-model", "", "router chat entry to pin")
 	embedModel := flag.String("embedding-model", "", "router embedding entry to pin")
 	logDir := flag.String("log-dir", "log", "audit log directory")
+	minScore := flag.Float64("min-score", 0, "drop documents below this similarity; zero keeps all")
 	flag.Parse()
 	var chat model.Client = scriptedChat{}
 	var embedder model.Embedder = hashEmbedder{}
@@ -97,7 +100,7 @@ func main() {
 		remote.EmbeddingModel = *embedModel
 		chat, embedder = remote, remote
 	}
-	out, err := run(context.Background(), chat, embedder, *question, *logDir)
+	out, err := run(context.Background(), chat, embedder, *question, *logDir, *minScore)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

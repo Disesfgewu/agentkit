@@ -11,7 +11,7 @@ func TestAnswersCiteTheMatchingDocument(t *testing.T) {
 		"Where do I submit travel expense receipts?":           "expenses",
 		"Who do I tell about a lost laptop?":                   "security",
 	} {
-		out, err := run(context.Background(), scriptedChat{}, hashEmbedder{}, question, t.TempDir())
+		out, err := run(context.Background(), scriptedChat{}, hashEmbedder{}, question, t.TempDir(), 0)
 		if err != nil {
 			t.Fatal(err)
 		}

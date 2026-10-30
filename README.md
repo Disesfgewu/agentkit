@@ -66,7 +66,9 @@ documents, err := retriever.Retrieve(ctx, "refund policy", 5)
 Two embedding rules that keep retrieval correct:
 
 - Vectors from different models cannot be compared. An index accepts one model, and a query or write from another fails with `ErrEmbeddingMismatch`. Router embeddings never fail over, for the same reason.
-- `MemoryVectorStore` does not survive a restart. Without `MinScore`, retrieval always returns the nearest documents, however unrelated, so set it when an agent must be able to report insufficient evidence.
+- `MemoryVectorStore` does not survive a restart. Without `MinScore`, retrieval always returns the nearest documents, however unrelated, and they can leak into the answer. Set it when an agent must be able to report insufficient evidence. Useful values depend on the embedding model, so measure your own scores.
+
+`Ask` counts a citation only when the answer contains the document ID in square brackets, such as `[leave]`, so an ID that is an ordinary word does not validate by being mentioned. Set `CitationMatch` to change this.
 
 ## Quickstart
 

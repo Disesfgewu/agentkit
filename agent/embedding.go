@@ -219,7 +219,7 @@ func (e *VectorRetriever) Retrieve(ctx context.Context, q string, k int) (docume
 	}
 	documents = []Document{}
 	for _, d := range hits {
-		if d.Score >= e.MinScore {
+		if e.MinScore == 0 || d.Score >= e.MinScore {
 			documents = append(documents, d)
 		}
 	}

@@ -251,3 +251,11 @@ func TestSeparateIngesterOverridesRetriever(t *testing.T) {
 		t.Fatalf("%d %v", store.writes, err)
 	}
 }
+
+func TestZeroMinScoreKeepsNegativeScores(t *testing.T) {
+	store := &splitStore{hits: []Document{{ID: "x", Score: -0.2}}}
+	r := VectorRetriever{Embedder: &wordEmbedder{model: "m1"}, Searcher: store}
+	if docs, err := r.Retrieve(context.Background(), "q", 1); err != nil || len(docs) != 1 {
+		t.Fatalf("%+v %v", docs, err)
+	}
+}

@@ -24,8 +24,8 @@ type RAGAgent struct {
 	Retriever Retriever
 	// K is the number of documents to retrieve; zero uses five.
 	K int
-	// CitationMatch decides whether an answer cites a document. Nil matches the
-	// document ID literally; set it when documents have an alias.
+	// CitationMatch decides whether an answer cites a document. Nil requires the
+	// ID in square brackets; set it when documents have an alias.
 	CitationMatch func(Document, string) bool
 	Before        func(context.Context, graph.State) error
 	After         func(context.Context, graph.Result) error
@@ -66,7 +66,7 @@ func (r *RAGAgent) Ask(ctx context.Context, q, reasoning string) (result graph.R
 		for _, d := range docs {
 			fmt.Fprintf(&b, "[%s] %s\n", d.ID, d.Text)
 		}
-		instruction := "Answer using the retrieved evidence. Cite document IDs. If evidence is insufficient, say so.\n" + b.String()
+		instruction := "Answer using the retrieved evidence. Cite each document you use by its ID in square brackets, such as [doc-1]. If evidence is insufficient, say so and cite nothing.\n" + b.String()
 		resp, err := r.Chat.Chat(ctx, []model.Message{{Role: "system", Content: instruction}, {Role: "user", Content: q}}, reasoning)
 		if err != nil {
 			return nil, err
@@ -107,5 +107,5 @@ func (r *RAGAgent) cites(d Document, answer string) bool {
 	if r.CitationMatch != nil {
 		return r.CitationMatch(d, answer)
 	}
-	return strings.Contains(answer, d.ID)
+	return strings.Contains(answer, "["+d.ID+"]")
 }
