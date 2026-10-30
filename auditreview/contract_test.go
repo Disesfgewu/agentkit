@@ -6,11 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/agent"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/agentlog"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/graph"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/gsd"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/model"
+	"github.com/Disesfgewu/agentkit/agent"
+	"github.com/Disesfgewu/agentkit/agentlog"
+	"github.com/Disesfgewu/agentkit/graph"
+	"github.com/Disesfgewu/agentkit/model"
 	"os"
 	"path/filepath"
 	"strings"
@@ -92,7 +91,11 @@ func TestBackgroundOperationsAutomaticallyCreateAudit(t *testing.T) {
 	if _, e := g.Run(context.Background(), nil); e != nil {
 		t.Fatal(e)
 	}
-	if e := gsd.WriteJSONL(filepath.Join(dir, "data.jsonl"), []int{1}); e != nil {
+	doc := filepath.Join(dir, "doc.md")
+	if e := os.WriteFile(doc, []byte("# heading\nbody\n"), 0600); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := agent.LoadMarkdown([]string{doc}); e != nil {
 		t.Fatal(e)
 	}
 	files, _ := filepath.Glob(filepath.Join(dir, "log", "*.log"))

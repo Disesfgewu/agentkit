@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/agentlog"
+	"github.com/Disesfgewu/agentkit/agentlog"
 	"io"
 	"net/http"
 	"net/url"
@@ -24,7 +24,9 @@ type RemoteClient struct {
 	BaseURL string
 	Token   string
 	Model   string
-	HTTP    *http.Client
+	// EmbeddingModel pins the router entry used by Embed.
+	EmbeddingModel string
+	HTTP           *http.Client
 }
 
 func NewRemote(baseURL, token, pinned string) (*RemoteClient, error) {
@@ -50,13 +52,30 @@ func (c *RemoteClient) Chat(ctx context.Context, r Request) (response Response, 
 	if err = span.Err(); err != nil {
 		return
 	}
-	body, err := json.Marshal(r)
-	if err != nil {
-		return Response{}, err
+	return response, c.post(ctx, "/v1/chat", r, &response)
+}
+
+// Embed never reuses the chat pin: EmbeddingModel names the embedding entry.
+func (c *RemoteClient) Embed(ctx context.Context, r EmbeddingRequest) (response EmbeddingResponse, err error) {
+	if r.Model == "" {
+		r.Model = c.EmbeddingModel
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(c.BaseURL, "/")+"/v1/chat", bytes.NewReader(body))
+	ctx, span := agentlog.Start(ctx, "model.RemoteClient.Embed", embeddingInput(r))
+	defer span.Finish(&err, func() any { return embeddingOutput(response) }, nil)
+	if err = span.Err(); err != nil {
+		return
+	}
+	return response, c.post(ctx, "/v1/embeddings", r, &response)
+}
+
+func (c *RemoteClient) post(ctx context.Context, path string, in, out any) error {
+	body, err := json.Marshal(in)
 	if err != nil {
-		return Response{}, err
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(c.BaseURL, "/")+path, bytes.NewReader(body))
+	if err != nil {
+		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.Token != "" {
@@ -64,22 +83,19 @@ func (c *RemoteClient) Chat(ctx context.Context, r Request) (response Response, 
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return Response{}, err
+		return err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if err != nil {
-		return Response{}, err
+		return err
 	}
 	if resp.StatusCode >= 300 {
 		var failure struct {
 			Error string `json:"error"`
 		}
 		_ = json.Unmarshal(raw, &failure)
-		return Response{}, fmt.Errorf("llmrouter HTTP %d: %s", resp.StatusCode, failure.Error)
+		return fmt.Errorf("llmrouter HTTP %d: %s", resp.StatusCode, failure.Error)
 	}
-	if err := json.Unmarshal(raw, &response); err != nil {
-		return Response{}, err
-	}
-	return response, nil
+	return json.Unmarshal(raw, out)
 }

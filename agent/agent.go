@@ -4,12 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/agentlog"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/graph"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/gsd"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/model"
-	"strings"
+	"github.com/Disesfgewu/agentkit/agentlog"
+	"github.com/Disesfgewu/agentkit/graph"
+	"github.com/Disesfgewu/agentkit/model"
 	"sync"
 )
 
@@ -35,6 +32,8 @@ type Document struct {
 	ID     string `json:"id"`
 	Text   string `json:"text"`
 	Source string `json:"source"`
+	// Score is the retriever's relevance, when it has one.
+	Score float64 `json:"score,omitempty"`
 }
 type Tool interface {
 	Name() string
@@ -54,9 +53,24 @@ type Template struct {
 	Model           model.Client
 	Retriever       Retriever
 	Tools           map[string]Tool
-	Knowledge       *gsd.Knowledge
 	Before          func(context.Context, graph.State) error
 	After           func(context.Context, graph.Result) error
+	// CitationMatch is forwarded to the RAGAgent behind Ask.
+	CitationMatch func(Document, string) bool
+	// ChatAgent replaces Model and SystemPrompt with any Chatter.
+	ChatAgent Chatter
+	// Ingester indexes documents; nil uses Retriever when it can ingest.
+	Ingester Ingester
+	// ToolRunner replaces Tools with any runner.
+	ToolRunner ToolRunner
+}
+
+// chatter returns the configured part, or a ChatAgent over the flat fields.
+func (a *Template) chatter() Chatter {
+	if a.ChatAgent != nil {
+		return a.ChatAgent
+	}
+	return &ChatAgent{Client: a.Model, SystemPrompt: a.SystemPrompt, MaxOutputTokens: a.MaxOutputTokens}
 }
 
 // BuildMessages applies the agent-level system prompt and an optional operation instruction.
@@ -66,15 +80,7 @@ func (a *Template) BuildMessages(ctx context.Context, messages []model.Message, 
 	if e != nil {
 		panic(e)
 	}
-	_, span := agentlog.Start(ctx, "agent.Template.BuildMessages", map[string]any{"system_prompt": a.SystemPrompt, "instruction": instruction, "messages": messages})
-	defer span.Finish(nil, func() any { return result }, nil)
-	span.Require()
-	system := strings.TrimSpace(strings.Join([]string{a.SystemPrompt, instruction}, "\n"))
-	result = append([]model.Message(nil), messages...)
-	if system != "" {
-		result = append([]model.Message{{Role: "system", Content: system}}, result...)
-	}
-	return result
+	return (&ChatAgent{SystemPrompt: a.SystemPrompt}).BuildMessages(ctx, messages, instruction)
 }
 
 func (a *Template) recorder() (*agentlog.Recorder, error) {
@@ -138,59 +144,8 @@ func (a *Template) Ask(ctx context.Context, q string, reasoning string) (result 
 	if err = span.Err(); err != nil {
 		return
 	}
-	g := graph.NewContext(ctx)
-	if err := g.AddNodeContext(ctx, "retrieve", func(ctx context.Context, s graph.State) (graph.State, error) {
-		if a.Retriever == nil {
-			return graph.State{"documents": []Document{}}, nil
-		}
-		docs, err := a.Retriever.Retrieve(ctx, q, 5)
-		return graph.State{"documents": docs}, err
-	}); err != nil {
-		return graph.Result{}, err
-	}
-	g.AddNodeContext(ctx, "generate", func(ctx context.Context, s graph.State) (graph.State, error) {
-		if a.Model == nil {
-			return nil, errors.New("model not configured")
-		}
-		docs, _ := s["documents"].([]Document)
-		var b strings.Builder
-		for _, d := range docs {
-			fmt.Fprintf(&b, "[%s] %s\n", d.ID, d.Text)
-		}
-		instruction := "Answer using the retrieved evidence. Cite document IDs. If evidence is insufficient, say so.\n" + b.String()
-		resp, err := a.Model.Chat(ctx, model.Request{Messages: a.BuildMessages(ctx, []model.Message{{Role: "user", Content: q}}, instruction), Reasoning: reasoning, MaxOutputTokens: a.MaxOutputTokens})
-		if err != nil {
-			return nil, err
-		}
-		return graph.State{"answer": resp.Text, "provider": resp.Provider, "model": resp.Model, "input_tokens": resp.InputTokens, "output_tokens": resp.OutputTokens, "total_tokens": resp.InputTokens + resp.OutputTokens, "usage_known": resp.UsageKnown}, nil
-	})
-	g.AddNodeContext(ctx, "validate", func(_ context.Context, s graph.State) (graph.State, error) {
-		answer, _ := s["answer"].(string)
-		docs, _ := s["documents"].([]Document)
-		cited := []string{}
-		for _, d := range docs {
-			if strings.Contains(answer, d.ID) || (strings.HasPrefix(d.ID, "card:") && strings.Contains(answer, strings.TrimPrefix(d.ID, "card:"))) {
-				cited = append(cited, d.ID)
-			}
-		}
-		return graph.State{"citation_ids": cited, "citation_valid": len(docs) == 0 || len(cited) > 0}, nil
-	})
-	g.EdgeContext(ctx, graph.Start, "retrieve")
-	g.EdgeContext(ctx, "retrieve", "generate")
-	g.EdgeContext(ctx, "generate", "validate")
-	g.EdgeContext(ctx, "validate", graph.End)
-	initial := graph.State{"question": q}
-	if a.Before != nil {
-		_, err := agentlog.Call(ctx, "agent.Hook.Before", initial, func(ctx context.Context) (bool, error) { e := a.Before(ctx, initial); return e == nil, e })
-		if err != nil {
-			return graph.Result{}, err
-		}
-	}
-	r, err := g.Run(ctx, initial)
-	if err == nil && a.After != nil {
-		_, err = agentlog.Call(ctx, "agent.Hook.After", r, func(ctx context.Context) (bool, error) { e := a.After(ctx, r); return e == nil, e })
-	}
-	result = r
+	rag := RAGAgent{Chat: a.chatter(), Retriever: a.Retriever, CitationMatch: a.CitationMatch, Before: a.Before, After: a.After}
+	result, err = rag.Ask(ctx, q, reasoning)
 	return result, err
 }
 func (a *Template) Chat(ctx context.Context, messages []model.Message, reasoning string) (response model.Response, err error) {
@@ -209,10 +164,7 @@ func (a *Template) Chat(ctx context.Context, messages []model.Message, reasoning
 	if err = span.Err(); err != nil {
 		return
 	}
-	if a.Model == nil {
-		return model.Response{}, errors.New("model not configured")
-	}
-	return a.Model.Chat(ctx, model.Request{Messages: a.BuildMessages(ctx, messages, ""), Reasoning: reasoning, MaxOutputTokens: a.MaxOutputTokens})
+	return a.chatter().Chat(ctx, messages, reasoning)
 }
 func (a *Template) RunTool(ctx context.Context, name string, input json.RawMessage) (output any, err error) {
 	ctx, e := a.auditContext(ctx)
@@ -224,30 +176,8 @@ func (a *Template) RunTool(ctx context.Context, name string, input json.RawMessa
 	if err = span.Err(); err != nil {
 		return
 	}
-	t, ok := a.Tools[name]
-	if !ok {
-		return nil, fmt.Errorf("unknown tool %s", name)
+	if a.ToolRunner != nil {
+		return a.ToolRunner.RunTool(ctx, name, input)
 	}
-	return agentlog.Call(ctx, "agent.Tool."+name, input, func(ctx context.Context) (any, error) { return t.Run(ctx, input) })
-}
-
-// Triage returns a rule-validated diagnostic suggestion from observable signals.
-// The generator truth file is never opened by this method.
-func (a *Template) Triage(ctx context.Context, observed gsd.Case) (prediction gsd.Prediction, err error) {
-	ctx, e := a.auditContext(ctx)
-	if e != nil {
-		return gsd.Prediction{}, e
-	}
-	ctx, span := agentlog.Start(ctx, "agent.Template.Triage", observed)
-	defer span.Finish(&err, func() any { return prediction }, nil)
-	if err = span.Err(); err != nil {
-		return
-	}
-	if err := ctx.Err(); err != nil {
-		return gsd.Prediction{}, err
-	}
-	if a.Knowledge == nil {
-		return gsd.Prediction{}, errors.New("GSD knowledge not configured")
-	}
-	return gsd.DecideContext(ctx, observed, *a.Knowledge), nil
+	return ToolBox(a.Tools).RunTool(ctx, name, input)
 }

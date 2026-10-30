@@ -3,7 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/agentlog"
+	"github.com/Disesfgewu/agentkit/agentlog"
 	"net/http"
 	"net/http/httptest"
 	"os"

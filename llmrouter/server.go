@@ -8,8 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/agentlog"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/model"
+	"github.com/Disesfgewu/agentkit/agentlog"
+	"github.com/Disesfgewu/agentkit/model"
 	"net"
 	"net/http"
 	"os"
@@ -44,6 +44,7 @@ type ModelInfo struct {
 	ContextTokens     int    `json:"context_tokens,omitempty"`
 	ReasoningMode     string `json:"reasoning_mode,omitempty"`
 	RequestsPerMinute int    `json:"requests_per_minute,omitempty"`
+	Kind              string `json:"kind,omitempty"`
 }
 
 func New(entries []model.Entry, options Options) (*Server, error) {
@@ -66,6 +67,7 @@ func (s *Server) Handler() http.Handler {
 	})
 	mux.HandleFunc("GET /v1/models", s.authorized(s.models))
 	mux.HandleFunc("POST /v1/chat", s.authorized(s.chat))
+	mux.HandleFunc("POST /v1/embeddings", s.authorized(s.embeddings))
 	return mux
 }
 
@@ -86,7 +88,7 @@ func (s *Server) models(w http.ResponseWriter, _ *http.Request) {
 	infos := make([]ModelInfo, 0, len(s.router.Entries))
 	for _, e := range s.router.Entries {
 		c := e.Config
-		infos = append(infos, ModelInfo{c.Name, c.Protocol, c.Model, c.Tier, c.ContextTokens, c.ReasoningMode, c.RequestsPerMinute})
+		infos = append(infos, ModelInfo{c.Name, c.Protocol, c.Model, c.Tier, c.ContextTokens, c.ReasoningMode, c.RequestsPerMinute, c.Kind})
 	}
 	sort.SliceStable(infos, func(i, j int) bool { return infos[i].Tier < infos[j].Tier })
 	writeJSON(w, http.StatusOK, map[string]any{"models": infos})
@@ -105,6 +107,26 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(agentlog.WithRecorder(r.Context(), s.options.Recorder), s.options.RequestTimeout)
 	defer cancel()
 	response, err := s.router.Chat(ctx, request)
+	if err != nil {
+		writeError(w, chatStatus(ctx, err), err)
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) embeddings(w http.ResponseWriter, r *http.Request) {
+	var request model.EmbeddingRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBytes)).Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, errors.New("invalid JSON request"))
+		return
+	}
+	if len(request.Input) == 0 {
+		writeError(w, http.StatusBadRequest, errors.New("input required"))
+		return
+	}
+	ctx, cancel := context.WithTimeout(agentlog.WithRecorder(r.Context(), s.options.Recorder), s.options.RequestTimeout)
+	defer cancel()
+	response, err := s.router.Embed(ctx, request)
 	if err != nil {
 		writeError(w, chatStatus(ctx, err), err)
 		return

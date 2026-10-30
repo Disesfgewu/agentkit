@@ -1,3 +1,3 @@
-module github.com/Disesfgewu/GSD_Survey/agent-template-client
+module github.com/Disesfgewu/agentkit
 
 go 1.27.1

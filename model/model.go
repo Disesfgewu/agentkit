@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/agentlog"
+	"github.com/Disesfgewu/agentkit/agentlog"
 	"io"
 	"net/http"
 	"net/url"
@@ -55,7 +55,16 @@ type Config struct {
 	Tier              int    `json:"tier,omitempty"`
 	MaxRetries        int    `json:"max_retries,omitempty"`
 	RequestsPerMinute int    `json:"requests_per_minute,omitempty"`
+	// TimeoutSeconds bounds one HTTP attempt; zero uses DefaultHTTPTimeout.
+	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+	// Kind is KindEmbedding for embedding models; empty means a chat model.
+	Kind string `json:"kind,omitempty"`
 }
+
+// DefaultHTTPTimeout leaves room for slow hosted models. A timeout that is too
+// short retries work the provider may still bill, without ever getting a reply.
+const DefaultHTTPTimeout = 3 * time.Minute
+
 type HTTPClient struct {
 	Config      Config
 	HTTP        *http.Client
@@ -83,7 +92,11 @@ func NewContext(ctx context.Context, c Config) (client *HTTPClient, err error) {
 	if !valid[c.Protocol] {
 		return nil, fmt.Errorf("unsupported protocol %s", c.Protocol)
 	}
-	return &HTTPClient{Config: c, HTTP: &http.Client{Timeout: 60 * time.Second}}, nil
+	timeout := DefaultHTTPTimeout
+	if c.TimeoutSeconds > 0 {
+		timeout = time.Duration(c.TimeoutSeconds) * time.Second
+	}
+	return &HTTPClient{Config: c, HTTP: &http.Client{Timeout: timeout}}, nil
 }
 func (c *HTTPClient) Chat(ctx context.Context, r Request) (response Response, err error) {
 	ctx, span := agentlog.Start(ctx, "model.HTTPClient.Chat", map[string]any{"provider": c.Config.Name, "protocol": c.Config.Protocol, "model": c.Config.Model, "request": r})
@@ -104,18 +117,29 @@ func (c *HTTPClient) Chat(ctx context.Context, r Request) (response Response, er
 	if err != nil {
 		return Response{}, err
 	}
+	raw, attempts, err := c.post(ctx, path, body, headers)
+	if err != nil {
+		return Response{}, err
+	}
+	parsed, parseErr := c.parse(ctx, raw)
+	parsed.Attempts = attempts
+	return parsed, parseErr
+}
+
+// post sends one JSON request with the provider's rate limit and bounded retries.
+func (c *HTTPClient) post(ctx context.Context, path string, body map[string]any, headers map[string]string) ([]byte, int, error) {
 	key := ""
 	if c.Config.APIKeyEnv != "" {
 		key = os.Getenv(c.Config.APIKeyEnv)
 		if key == "" {
-			return Response{}, fmt.Errorf("missing API key environment variable %s", c.Config.APIKeyEnv)
+			return nil, 0, fmt.Errorf("missing API key environment variable %s", c.Config.APIKeyEnv)
 		}
 	}
 	u := strings.TrimRight(c.Config.BaseURL, "/") + path
 	b, _ := json.Marshal(body)
 	client := c.HTTP
 	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
+		client = &http.Client{Timeout: DefaultHTTPTimeout}
 	}
 	maxRetries := c.Config.MaxRetries
 	if maxRetries == 0 {
@@ -123,22 +147,20 @@ func (c *HTTPClient) Chat(ctx context.Context, r Request) (response Response, er
 	}
 	for attempt := 0; ; attempt++ {
 		if err := c.awaitRate(ctx); err != nil {
-			return Response{}, err
+			return nil, attempt, err
 		}
 		raw, status, retryAfter, requestErr := c.doRequest(ctx, client, u, b, headers, key, attempt)
 		if requestErr == nil && status < 300 {
-			parsed, parseErr := c.parse(ctx, raw)
-			parsed.Attempts = attempt + 1
-			return parsed, parseErr
+			return raw, attempt + 1, nil
 		}
 		// A transport timeout/reset is retryable when the caller's own context is
 		// still valid. Caller cancellation remains terminal.
 		retryable := (requestErr != nil && ctx.Err() == nil) || status == http.StatusTooManyRequests || status == 500 || status == 502 || status == 503 || status == 504
 		if !retryable || attempt >= maxRetries {
 			if requestErr != nil {
-				return Response{}, requestErr
+				return nil, attempt, requestErr
 			}
-			return Response{}, fmt.Errorf("%s HTTP %d after %d retries (body withheld)", c.Config.Name, status, attempt)
+			return nil, attempt, fmt.Errorf("%s HTTP %d after %d retries (body withheld)", c.Config.Name, status, attempt)
 		}
 		delay := time.Second << attempt
 		if retryAfter > delay {
@@ -149,7 +171,7 @@ func (c *HTTPClient) Chat(ctx context.Context, r Request) (response Response, er
 		}
 		select {
 		case <-ctx.Done():
-			return Response{}, ctx.Err()
+			return nil, attempt, ctx.Err()
 		case <-time.After(delay):
 		}
 	}

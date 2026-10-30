@@ -1,94 +1,119 @@
-# GSD traceable agent template client
+# agentkit
 
-**Audit review update (2026-10-27):** The 13 reproduced defects now have passing regression tests. A real-call rerun and strict verification are documented in [PR review fixes](../docs/fleet-http/08_PR_REVIEW_FIXES.md). Coverage and lifecycle limits are explicit; this is not a claim that every arbitrary Go function is intercepted.
+Go building blocks for auditable agentic applications: a LangGraph-style state graph, a multi-provider LLM client and router, a composable agent template, and a hash-chained audit log. No third-party dependencies.
 
-The existing `agent.Template` owns automatic logging. Use `template.Runtime()` for HTTP/custom operations; it reuses `Template.recorder()` and the same logger as `Template.Chat`. `Runtime.JSON` records HTTP calls automatically; `Runtime.Execute` runs custom operations with one completion and nested call IDs. Applications do not call `Recorder.Record`. `NewRuntime` is only a convenience constructor delegating to Template; it does not implement a separate logging system. An empty logDir defaults to `log/`. See the [real-call rerun and audit reconciliation](../docs/fleet-http/06_PACKAGE_AUTOLOG.md).
+This is a LangGraph-inspired Go runtime, not an official port. It implements the low-level semantics and makes no API compatibility claim. [`examples/langgraph_node.py`](examples/langgraph_node.py) runs the Go client as a node inside a Python LangGraph workflow.
 
-A Go package for evidence retrieval, model calls, conditional state graphs, and replay of the existing GSD diagnostic validation set. This is a LangGraph-inspired Go runtime, not an official Go port of LangGraph. The optional [Python node bridge](examples/langgraph_node.py) runs the Go client inside a Python LangGraph workflow.
+## Packages
 
-## Quick start
+| Package | Purpose | Depends on |
+|---|---|---|
+| `graph` | Named nodes, fixed and conditional edges, bounded loops, per-node patch commit, execution trace, checkpoint store interface | `agentlog` |
+| `model` | Chat and embedding clients over six HTTP protocols, declared reasoning modes, retry and rate limit, tier-based `Router`, `RemoteClient` | `agentlog` |
+| `agent` | Independent parts (`ChatAgent`, `EmbeddingAgent`, `RAGAgent`, `ToolBox`) and `Template`, which composes them under one audit session | `graph`, `model`, `agentlog` |
+| `agentlog` | One audit session per call tree, redaction, and a verifiable SHA-256 chain | none |
+| `llmrouter` | Serves `model.Router` over HTTP | `model`, `agentlog` |
 
-Requires Go 1.27.1 or newer. From this directory:
+Use only what you need. `graph` works without `agent` or `model`.
+
+## Install
+
+Requires Go 1.27.1 or newer. The repository is private, so tell Go not to use the public proxy:
 
 ```powershell
-go test ./...
-go run ./cmd/agentctl benchmark
-Copy-Item .env.example .env
-# Fill only the provider/model values you intend to use in .env.
-go run ./cmd/agentctl ask -env .env -model openai -q "What supports valve-stick diagnosis?" -knowledge ../generator/agent/knowledge.json
-go run ./cmd/agentctl chat -env .env -model ollama -system-prompt "You are a traceable equipment agent." -q "Hello"
+$env:GOPRIVATE = "github.com/Disesfgewu/*"
+go get github.com/Disesfgewu/agentkit@latest
 ```
 
-For a remote Ollama device, set `OLLAMA_BASE_URL` to its reachable HTTP address. `models.example.json` uses environment expansion for endpoint and model names; copy and edit its `reasoning_mode` and `context_tokens` per *actual model capabilities*. Leave `-reasoning` unset for models without thinking support. Examples: `-reasoning high` for a compatible OpenAI Responses or Google level model; `-reasoning on` for an Ollama thinking model. A model with an incompatible mode fails before the HTTP call.
+## Compose an agent
 
-The `.env` file is ignored by Git. The CLI does not print API keys or upstream error bodies. It reads only the selected provider's key. Keep any local configuration containing secrets outside version control.
+An agent is a set of independent parts. Each part does one thing, works without the others, and sits behind a small interface, so you can use one alone or replace it with your own.
 
-## API packages
+| Part | Does one thing | Interface |
+|---|---|---|
+| `ChatAgent` | Applies a system prompt and calls a chat client | `Chatter` |
+| `Indexer` | Chunks, embeds, and writes documents | `Ingester` |
+| `VectorRetriever` | Embeds a query and searches an index | `Retriever` |
+| `EmbeddingAgent` | An `Indexer` and a `VectorRetriever` sharing one embedder and store | `Ingester`, `Retriever` |
+| `LocalRetriever` | Keyword search over loaded documents | `Retriever` |
+| `RAGAgent` | Retrieves, answers, and validates citations | `Asker` |
+| `ToolBox` | Calls registered tools | `ToolRunner` |
+| `MemoryVectorStore` | Exact cosine search in memory | `VectorWriter`, `VectorSearcher` |
 
-- `graph`: named nodes, fixed and conditional edges, bounded loops, per-node patch commit, execution trace, checkpoint storage interface.
-- `model`: six HTTP protocols, explicit reasoning wire modes, token estimate based router with failover.
-- `agent`: composable template with `Ask`, `Chat`, `GetInformation`, `Triage`, `RunTool`, hooks, Markdown and GSD card retrieval.
-- `agentlog`: one audit session shared by every framework function in the call tree, with one completion record per invocation, parent relationships, token usage, timing, redaction, and a verifiable hash chain.
-- `gsd`: legacy JSONL reader, rule baseline, evaluator. Truth is read only by `benchmark` and `evaluate`; retrieval indexes knowledge cards and source claims only.
-
-Go uses interfaces and embedding for polymorphism. Extend `agent.Template` through embedding, inject a `model.Client`, `agent.Retriever`, or `agent.Tool`, and use `graph.New()` to define domain-specific workflows. Tool execution is explicitly registered by the host application.
-
-The system prompt is a first-class agent property used by both `Ask` and `Chat`:
+`agent.New` composes parts under one audit session. Every part is optional; calling a method whose part is missing returns an error.
 
 ```go
-equipmentAgent := &agent.Template{
-    Name:         "etch-triage",
-    SystemPrompt: "You are a traceable semiconductor equipment triage agent. Never invent thresholds or SOPs.",
-    Model:        routedModel,
-    Retriever:    evidenceRetriever,
-    Tools:        registeredTools,
-}
-defer equipmentAgent.Close()
+a := agent.New(agent.Config{
+    Name:      "handbook",
+    Chat:      agent.NewChatAgent(chatClient, "Answer only from the supplied evidence."),
+    Retriever: agent.NewEmbeddingAgent(embedder, nil), // nil store uses MemoryVectorStore
+})
+defer a.Close()
+
+a.Ingest(ctx, documents...)
+result, err := a.Ask(ctx, "How many days of annual leave do employees get?", "")
 ```
 
-`Ask` appends its evidence and citation contract to this prompt. `Chat` sends the configured prompt directly before caller messages. `BuildMessages` is public for derived agent types that need to inspect or extend prompt construction. The effective prompt and final provider messages are included in the audit log.
+Depend on the narrowest interface you need. A function that only chats takes an `agent.Chatter`, so it accepts a `ChatAgent`, a `Template`, or your own type. To use a vector database, implement `VectorWriter` and `VectorSearcher`. [`examples/rag`](examples/rag/main.go) runs offline, or against real providers with `-router`.
 
-`agent.Template` and every CLI command create one `log/{agentName}_{YYYY-MM-DD-HH-MM-SS.nanoseconds}.log` audit session. The same recorder follows `context.Context` through the template, hooks, graph construction and execution, every node and conditional router, checkpoint operation, RAG retrieval and tokenization, provider router, HTTP payload/response parsing, GSD matching/decisions/evaluation, and registered tool boundary. Each completed function invocation writes one record; `call_id` and `parent_call_id` retain nesting without duplicate START/END lines:
+Parts used alone need no `Template`:
 
-```text
-[DEBUG] agent:gsd-agent, func:model.HTTPClient.Chat(input:{...}), return:{...}, token:210, response_time:526ms, time:..., session:..., seq:42, call_id:9, parent_call_id:3, phase:END, prev_hash:..., hash:...
+```go
+retriever := agent.VectorRetriever{Embedder: embedder, Searcher: myDatabase, MinScore: 0.3}
+documents, err := retriever.Retrieve(ctx, "refund policy", 5)
 ```
 
-Every record is flushed to disk. `seq` provides total ordering, call IDs reconstruct nesting, and the SHA-256 chain detects modification, reordering, and deletion inside the retained file. An external signed final hash is still needed to prove that the tail was not truncated. Verify a file with:
+Two embedding rules that keep retrieval correct:
 
-Completion-only logging avoids serializing the same large state twice. A process terminated inside an unfinished function has no completion record; production crash evidence should also come from the process supervisor/runtime log.
+- Vectors from different models cannot be compared. An index accepts one model, and a query or write from another fails with `ErrEmbeddingMismatch`. Router embeddings never fail over, for the same reason.
+- `MemoryVectorStore` does not survive a restart. Without `MinScore`, retrieval always returns the nearest documents, however unrelated, so set it when an agent must be able to report insufficient evidence.
+
+## Quickstart
 
 ```powershell
-go run ./cmd/agentctl audit-verify -log log/gsd-agent_2026-10-23-16-28-13.000000000.log
+go run ./examples/quickstart
 ```
 
-Token is `?` for functions or providers without reported usage. Known secret field names such as `api_key`, `authorization`, `password`, and `secret` are recursively redacted. Prompts, retrieved documents, tool inputs, and outputs are deliberately retained for audit, so the log directory requires production access control and retention policy.
+`agent.Template` also works with flat fields (`Model`, `SystemPrompt`, `Tools`). [`examples/quickstart`](examples/quickstart/main.go) is a complete support-ticket agent that needs no provider account. The LLM classifies a ticket, a plain function picks the route, and the graph calls a tool or searches documents before replying:
 
-Go cannot intercept arbitrary functions compiled in another package. Framework functions are already instrumented. Extension code should preserve the supplied context and use `agentlog.Call(ctx, "package.Function", input, fn)` around each internal extension function; the registered tool boundary is logged automatically even if a tool has not added internal spans. Logger serialization, redaction, and file-writing internals are excluded from self-logging to prevent recursive logging.
-
-To score predictions from another agent:
-
-```powershell
-go run ./cmd/agentctl evaluate -predictions path/to/predictions.jsonl
-go run ./cmd/agentctl llm-eval -env .env -model nim -limit 8 -delay 10s -out ../.agent-artifacts/llm_predictions.jsonl
+```go
+g := graph.NewContext(ctx)
+g.AddNodeContext(ctx, "classify", classify)
+g.AddNodeContext(ctx, "lookup_order", lookupOrder)
+g.AddNodeContext(ctx, "search_docs", searchDocs)
+g.AddNodeContext(ctx, "reply", reply)
+g.EdgeContext(ctx, graph.Start, "classify")
+g.ConditionalContext(ctx, "classify", route, map[string]string{"refund": "lookup_order", "question": "search_docs"})
+g.EdgeContext(ctx, "lookup_order", "reply")
+g.EdgeContext(ctx, "search_docs", "reply")
+g.EdgeContext(ctx, "reply", graph.End)
+result, err := g.Run(ctx, graph.State{"ticket": ticket})
 ```
 
-The benchmark action strings are diagnostic suggestions for synthetic data, not equipment control commands or fab SOPs.
+A node receives a copy of the state and returns a patch, which is committed only if the node succeeds. The copy is top-level, so treat nested values as immutable. `MaxSteps` defaults to 32; raise it for long-running loops and set `RetainPatches = false` to bound memory.
 
-See [technical report](TECHNICAL_REPORT.md) for protocol boundaries, actual 10 Hz raw numeric rows, wafer-feature tables around a fault onset, Agent JSON previews, field dictionaries, experiment results, and limitations.
+Graph limits: no reducers, parallel supersteps, or interrupts. The included `MemoryStore` checkpoint does not survive a restart; implement `graph.Store` for durable resume.
 
-To inspect the Generator dataset as full CSV files rather than Agent JSON, run from `generator/`:
+## Models
 
-```powershell
-go run ./cmd/dsbuild -template benchmarks/templates/agent_preview.yaml -out runs/agent_preview -workers 4
-go run ./cmd/dsexportcsv -data runs/agent_preview -split test -out runs/agent_preview_csv/test -raw=true
-```
+Every provider implements `model.Client` for chat, and `model.Embedder` where it has an embedding API, so application code does not depend on one.
 
-The measured preview export contains 1,125,900 raw numeric rows in `raw_values.csv`, plus complete feature, event, truth, and frame-metadata CSV files.
+| Protocol | Chat endpoint | Embedding endpoint | Reasoning modes |
+|---|---|---|---|
+| `openai_responses` | `/responses` | `/embeddings` | `openai_effort` |
+| `openai_chat` | `/chat/completions` | `/embeddings` | none |
+| `nim` | `/chat/completions` | `/embeddings` | `nim_enable_thinking`, `nim_thinking_mode` |
+| `google` | `/models/{model}:generateContent` | `/models/{model}:batchEmbedContents` | `google_level`, `google_budget` |
+| `anthropic` | `/v1/messages` | none | `anthropic_adaptive`, `anthropic_budget` |
+| `ollama` | `/api/chat` | `/api/embed` | `ollama_think` |
+
+Reasoning is declared per model in the configuration, because the provider alone does not determine it. A model with an incompatible mode fails before the HTTP call. HTTP mock tests verify request and response handling; they do not prove that a given live model accepts a mode. Copy `models.example.json` and `.env.example`, then fill in only the providers you use. Mark embedding models with `"kind": "embedding"`.
+
+One HTTP attempt times out after `timeout_seconds`, three minutes by default. Keep it above your model's slowest normal reply: a timeout retries a request the provider may still bill, without ever returning the answer.
 
 ## LLMRouter service
 
-`cmd/llmrouter` serves `model.Router` over HTTP so agents share one quota, one set of provider credentials, and one failover policy. Agents use `model.RemoteClient`, which implements `model.Client`, so graph nodes do not change.
+`cmd/llmrouter` lets agents share one quota, one set of provider credentials, and one failover policy. Agents use `model.RemoteClient`, so graph nodes do not change.
 
 ```powershell
 go run ./cmd/llmrouter -config models.example.json -env .env -addr 127.0.0.1:8787
@@ -97,21 +122,32 @@ go run ./cmd/llmrouter -config models.example.json -env .env -addr 127.0.0.1:878
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/chat` | Body is `model.Request`, reply is `model.Response` with the provider and model actually used |
+| `POST /v1/embeddings` | Body is `model.EmbeddingRequest`, reply is `model.EmbeddingResponse` |
 | `GET /v1/models` | Lists loaded models without endpoints or credential names |
 | `GET /healthz` | Liveness, no token required |
 
-- Models whose environment is unset are skipped and printed at startup. Set `requests_per_minute` and `max_retries` per model in the configuration file; the limit is shared by every agent.
-- Set `model` in the request (or `ROUTER_MODEL`) to pin one entry by name. A pinned request never fails over; use this for experiments whose results must stay comparable.
+- Models whose environment is unset are skipped and printed at startup. Set `requests_per_minute` and `max_retries` per model; the limit is shared by every agent.
+- Set `model` in the request to pin one entry by name. A pinned request never fails over; use this when results must stay comparable.
 - A non-loopback `-addr` requires a bearer token in `LLMROUTER_TOKEN`.
 - `-request-timeout` bounds retries and failover per request and must stay below `model.RemoteTimeout`.
-- The router writes its own hash-chained audit log under `-log-dir`. It does not yet share call IDs with the calling agent's log.
+- The router writes its own hash-chained audit log. It does not yet share call IDs with the calling agent's log.
 
-`ai-agent-platform` connects with `-provider router` and `ROUTER_BASE_URL`, optional `ROUTER_API_KEY`, and optional `ROUTER_MODEL`. Its `-llm-retries`, `-rpm`, and `-reasoning-mode` flags do not apply to this provider because the router configuration owns them.
+## Audit log
 
-# Audit lifecycle update (2026-10-27)
+`agent.Template` owns the session. The same recorder follows `context.Context` through the template, hooks, graph nodes and routers, checkpoints, retrieval, provider calls, and tools. Each completed call writes one record with parent ID, token usage, timing, and a hash link.
 
-`agent.Template` owns its automatic logger. Obtain `Runtime()` to propagate its context to application callbacks; use `Runtime.Execute` for additional functions. Call `Template.Close` or the owning runtime's `Close` after work completes. Borrowed runtimes cannot close their owner, and a closed template cannot be reopened. Do not replace the public compatibility `Logger` field while work is running.
+```powershell
+go run ./cmd/agentctl audit-verify -log log/your-agent_2026-10-23-16-28-13.000000000.log
+```
 
-Wrapped standalone operations without a recorder now create a short-lived session under `log/`. One `.log` END record is emitted per call ID; `.log.journal` retains durable BEGIN snapshots, and `.log.seal` records orderly completion. Keep all three files. `agentlog.Verify` requires the complete set; `VerifyLegacy` only checks historical hash chains. Audit failures propagate as errors (or panic for legacy methods without an error return). Close waits for active calls and must be invoked outside those calls. Arbitrary external Go functions are not intercepted automatically: wrap their execution to join the audit trail.
+- Known secret field names such as `api_key` and `authorization` are redacted. Prompts, documents, and tool inputs are retained on purpose, so the log directory needs access control.
+- The chain detects modification, reordering, and deletion inside the file. Proving the tail was not truncated needs an external signed final hash.
+- Go cannot intercept arbitrary functions. Wrap your own with `agentlog.Call(ctx, "package.Function", input, fn)` and pass the supplied context along.
+- For HTTP or custom operations, use `template.Runtime()`. It reuses the template's logger; `Runtime.JSON` records HTTP calls and `Runtime.Execute` records custom operations.
 
-Regression results, actual LLM scores, limitations and local evidence paths: [PR review fixes](../docs/fleet-http/08_PR_REVIEW_FIXES.md).
+## CLI
+
+```powershell
+go run ./cmd/agentctl chat -env .env -model ollama -system-prompt "You are a helpful agent." -q "Hello"
+go run ./cmd/agentctl ask -env .env -model openai -docs docs/a.md,docs/b.md -q "What does the policy say?"
+```

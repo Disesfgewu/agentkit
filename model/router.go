@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/agentlog"
+	"github.com/Disesfgewu/agentkit/agentlog"
 	"sort"
 )
 
@@ -33,7 +33,7 @@ func (r Router) Chat(ctx context.Context, req Request) (response Response, err e
 	}
 	var entries []Entry
 	for _, e := range r.Entries {
-		if req.Model == "" || e.Config.Name == req.Model {
+		if e.Config.Kind != KindEmbedding && (req.Model == "" || e.Config.Name == req.Model) {
 			entries = append(entries, e)
 		}
 	}

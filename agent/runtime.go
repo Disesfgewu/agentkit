@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/agentlog"
+	"github.com/Disesfgewu/agentkit/agentlog"
 	"io"
 	"net/http"
 )

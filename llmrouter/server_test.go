@@ -3,8 +3,8 @@ package llmrouter
 import (
 	"context"
 	"encoding/json"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/agentlog"
-	"github.com/Disesfgewu/GSD_Survey/agent-template-client/model"
+	"github.com/Disesfgewu/agentkit/agentlog"
+	"github.com/Disesfgewu/agentkit/model"
 	"io"
 	"net/http"
 	"net/http/httptest"
