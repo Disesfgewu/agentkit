@@ -124,16 +124,18 @@ go run ./cmd/llmrouter -config models.example.json -env .env -addr 127.0.0.1:878
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/chat` | Body is `model.Request`, reply is `model.Response` with the provider and model actually used |
-| `POST /v1/embeddings` | Body is `model.EmbeddingRequest`, reply is `model.EmbeddingResponse` |
-| `GET /v1/models` | Lists loaded models without endpoints or credential names |
-| `GET /healthz` | Liveness, no token required |
+| `POST /v1/chat` | Body is `model.Request`; `data` is `model.Response` with the provider and model actually used |
+| `POST /v1/embeddings` | Body is `model.EmbeddingRequest`; `data` is `model.EmbeddingResponse` |
+| `GET /v1/models` | `data.models` lists loaded models without endpoints or credential names |
+| `GET /healthz` | Liveness, no token required, not audited |
+
+Every reply is an [envelope](#envelope), so read the payload from `data` and failures from `error`. `model.RemoteClient` unwraps it for Go callers. A client in another language must do the same: check `ok`, then use `data`. Router failures use these codes: `unauthorized` (401), `messages_required` and `input_required` (400), `model_unknown` (404), `no_eligible_model` (422), `timeout` (504), `upstream_failed` (502).
 
 - Models whose environment is unset are skipped and printed at startup. Set `requests_per_minute` and `max_retries` per model; the limit is shared by every agent.
 - Set `model` in the request to pin one entry by name. A pinned request never fails over; use this when results must stay comparable.
 - A non-loopback `-addr` requires a bearer token in `LLMROUTER_TOKEN`.
 - `-request-timeout` bounds retries and failover per request and must stay below `model.RemoteTimeout`.
-- The router writes its own hash-chained audit log. It does not yet share call IDs with the calling agent's log.
+- The router writes its own hash-chained audit log. Each request records the caller's session and call ID, and the caller records the router's receipt, so the two logs can be joined.
 
 ## Envelope
 

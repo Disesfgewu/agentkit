@@ -3,7 +3,9 @@ package llmrouter
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"github.com/Disesfgewu/agentkit/agentlog"
+	"github.com/Disesfgewu/agentkit/envelope"
 	"github.com/Disesfgewu/agentkit/model"
 	"io"
 	"net/http"
@@ -84,6 +86,12 @@ func remote(t *testing.T, url, token, pinned string) *model.RemoteClient {
 	return client
 }
 
+// failed reports whether err is the router Problem with this status and code.
+func failed(err error, status int, code string) bool {
+	var p *envelope.Problem
+	return errors.As(err, &p) && p.Status == status && p.Code == code
+}
+
 func TestRemoteReportsActualProviderAndUsage(t *testing.T) {
 	url, _ := upstream(t, 200, "ok")
 	rec := newRecorder(t)
@@ -115,11 +123,11 @@ func TestFailoverUnlessPinned(t *testing.T) {
 		t.Fatalf("failover %+v %v %d/%d", out, err, brokenCalls.Load(), healthyCalls.Load())
 	}
 	_, err = remote(t, s.URL, "", "broken").Chat(context.Background(), hello)
-	if err == nil || !strings.Contains(err.Error(), "HTTP 502") || healthyCalls.Load() != 1 {
+	if !failed(err, http.StatusBadGateway, CodeUpstreamFailed) || healthyCalls.Load() != 1 {
 		t.Fatalf("pinned model must not fail over: %v calls=%d", err, healthyCalls.Load())
 	}
 	_, err = remote(t, s.URL, "", "missing").Chat(context.Background(), hello)
-	if err == nil || !strings.Contains(err.Error(), "HTTP 404") {
+	if !failed(err, http.StatusNotFound, CodeModelUnknown) {
 		t.Fatalf("unknown pin: %v", err)
 	}
 }
@@ -131,7 +139,8 @@ func TestRemoteDoesNotRetry(t *testing.T) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer s.Close()
-	if _, err := remote(t, s.URL, "", "").Chat(context.Background(), hello); err == nil || calls.Load() != 1 {
+	// A reply that is not an envelope is still reported as a Problem.
+	if _, err := remote(t, s.URL, "", "").Chat(context.Background(), hello); !failed(err, http.StatusServiceUnavailable, envelope.CodeBadEnvelope) || calls.Load() != 1 {
 		t.Fatalf("expected one failed call: %v calls=%d", err, calls.Load())
 	}
 }
@@ -139,7 +148,7 @@ func TestRemoteDoesNotRetry(t *testing.T) {
 func TestTokenProtectsEverythingButHealth(t *testing.T) {
 	url, _ := upstream(t, 200, "ok")
 	s := start(t, Options{Token: "secret"}, entry(t, "primary", url, 0))
-	if _, err := remote(t, s.URL, "wrong", "").Chat(context.Background(), hello); err == nil || !strings.Contains(err.Error(), "HTTP 401") {
+	if _, err := remote(t, s.URL, "wrong", "").Chat(context.Background(), hello); !failed(err, http.StatusUnauthorized, CodeUnauthorized) {
 		t.Fatalf("wrong token: %v", err)
 	}
 	if _, err := remote(t, s.URL, "secret", "").Chat(context.Background(), hello); err != nil {
@@ -167,10 +176,14 @@ func TestModelsListingHidesEndpointsAndCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	var body struct {
-		Models []map[string]any `json:"models"`
+	var env envelope.Envelope
+	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+		t.Fatal(err)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	body, err := envelope.Decode[struct {
+		Models []map[string]any `json:"models"`
+	}](env)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if len(body.Models) != 1 || body.Models[0]["name"] != "primary" {
@@ -191,12 +204,42 @@ func TestRequestValidationAndDeadline(t *testing.T) {
 	}))
 	defer hang.Close()
 	s := start(t, Options{RequestTimeout: 50 * time.Millisecond}, entry(t, "slow", hang.URL, 0))
-	if _, err := remote(t, s.URL, "", "").Chat(context.Background(), model.Request{}); err == nil || !strings.Contains(err.Error(), "HTTP 400") {
+	if _, err := remote(t, s.URL, "", "").Chat(context.Background(), model.Request{}); !failed(err, http.StatusBadRequest, CodeMessagesRequired) {
 		t.Fatalf("empty messages: %v", err)
 	}
-	if _, err := remote(t, s.URL, "", "").Chat(context.Background(), hello); err == nil || !strings.Contains(err.Error(), "HTTP 504") {
+	if _, err := remote(t, s.URL, "", "").Chat(context.Background(), hello); !failed(err, http.StatusGatewayTimeout, envelope.CodeTimeout) {
 		t.Fatalf("deadline: %v", err)
 	}
+}
+
+// The caller's audit log and the router's audit log name each other's records.
+func TestCallerAndRouterAuditLogsCrossReference(t *testing.T) {
+	url, _ := upstream(t, 200, "ok")
+	routerLog, callerLog := newRecorder(t), newRecorder(t)
+	s := start(t, Options{Recorder: routerLog}, entry(t, "primary", url, 0))
+	ctx := agentlog.WithRecorder(context.Background(), callerLog)
+	if _, err := remote(t, s.URL, "", "").Chat(ctx, hello); err != nil {
+		t.Fatal(err)
+	}
+	if err := callerLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agentlog.Verify(callerLog.Path); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { // runs after start's cleanup has closed the router log
+		caller, _ := os.ReadFile(callerLog.Path)
+		router, _ := os.ReadFile(routerLog.Path)
+		if !strings.Contains(string(caller), `"server_audit":{"call_id":1,"hash":"`) || !strings.Contains(string(caller), routerLog.SessionID) {
+			t.Errorf("caller log does not name the router record: %s", caller)
+		}
+		if !strings.Contains(string(router), `"parent":{"call_id":2,"session":"`+callerLog.SessionID+`"}`) {
+			t.Errorf("router log does not name the caller: %s", router)
+		}
+		if !strings.Contains(string(router), "func:llmrouter.Server.chat(") || !strings.Contains(string(router), "func:model.Router.Chat(") {
+			t.Error("router request and routing must both be audited")
+		}
+	})
 }
 
 func TestRequireToken(t *testing.T) {

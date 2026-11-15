@@ -1,16 +1,13 @@
 package model
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/Disesfgewu/agentkit/agentlog"
-	"io"
+	"github.com/Disesfgewu/agentkit/envelope"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 )
 
@@ -52,7 +49,7 @@ func (c *RemoteClient) Chat(ctx context.Context, r Request) (response Response, 
 	if err = span.Err(); err != nil {
 		return
 	}
-	return response, c.post(ctx, "/v1/chat", r, &response)
+	return post[Response](ctx, c, "/v1/chat", r)
 }
 
 // Embed never reuses the chat pin: EmbeddingModel names the embedding entry.
@@ -65,37 +62,17 @@ func (c *RemoteClient) Embed(ctx context.Context, r EmbeddingRequest) (response 
 	if err = span.Err(); err != nil {
 		return
 	}
-	return response, c.post(ctx, "/v1/embeddings", r, &response)
+	return post[EmbeddingResponse](ctx, c, "/v1/embeddings", r)
 }
 
-func (c *RemoteClient) post(ctx context.Context, path string, in, out any) error {
-	body, err := json.Marshal(in)
+// post calls the router through the shared envelope client, which unwraps the
+// reply and records the router's audit receipt in the caller's session. The
+// error is a *envelope.Problem wrapped with the router's name.
+func post[Out any](ctx context.Context, c *RemoteClient, path string, in any) (Out, error) {
+	client := &envelope.Client{BaseURL: c.BaseURL, Bearer: c.Token, HTTP: c.HTTP, MaxBodyBytes: 8 << 20}
+	out, _, err := envelope.Call[Out](ctx, client, "POST", path, in)
 	if err != nil {
-		return err
+		return out, fmt.Errorf("llmrouter: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(c.BaseURL, "/")+path, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
-	}
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode >= 300 {
-		var failure struct {
-			Error string `json:"error"`
-		}
-		_ = json.Unmarshal(raw, &failure)
-		return fmt.Errorf("llmrouter HTTP %d: %s", resp.StatusCode, failure.Error)
-	}
-	return json.Unmarshal(raw, out)
+	return out, nil
 }

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/Disesfgewu/agentkit/agentlog"
+	"github.com/Disesfgewu/agentkit/envelope"
 	"github.com/Disesfgewu/agentkit/model"
 	"net"
 	"net/http"
@@ -60,102 +61,88 @@ func New(entries []model.Entry, options Options) (*Server, error) {
 	return &Server{router: model.Router{Entries: entries}, options: options}, nil
 }
 
+// Problem codes of the router, in addition to those of package envelope.
+const (
+	CodeUnauthorized     = "unauthorized"
+	CodeMessagesRequired = "messages_required"
+	CodeInputRequired    = "input_required"
+	CodeModelUnknown     = "model_unknown"
+	CodeNoEligibleModel  = "no_eligible_model"
+	CodeUpstreamFailed   = "upstream_failed"
+)
+
+// ModelList is the data of GET /v1/models.
+type ModelList struct {
+	Models []ModelInfo `json:"models"`
+}
+
+// Handler serves the router. Every reply is an envelope.Envelope, and every
+// request except the liveness probe is one audit call that records its caller.
 func (s *Server) Handler() http.Handler {
+	api := &envelope.Server{Recorder: s.options.Recorder, MaxBodyBytes: maxRequestBytes, Timeout: s.options.RequestTimeout}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		envelope.Write(w, envelope.Success(map[string]any{"ok": true}))
 	})
-	mux.HandleFunc("GET /v1/models", s.authorized(s.models))
-	mux.HandleFunc("POST /v1/chat", s.authorized(s.chat))
-	mux.HandleFunc("POST /v1/embeddings", s.authorized(s.embeddings))
+	mux.Handle("GET /v1/models", s.authorized(envelope.Handle(api, "llmrouter.Server.models", s.models)))
+	mux.Handle("POST /v1/chat", s.authorized(envelope.Handle(api, "llmrouter.Server.chat", s.chat)))
+	mux.Handle("POST /v1/embeddings", s.authorized(envelope.Handle(api, "llmrouter.Server.embeddings", s.embeddings)))
 	return mux
 }
 
-func (s *Server) authorized(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func (s *Server) authorized(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.options.Token != "" {
 			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 			if subtle.ConstantTimeCompare([]byte(got), []byte(s.options.Token)) != 1 {
-				writeError(w, http.StatusUnauthorized, errors.New("invalid router token"))
+				envelope.Write(w, envelope.Failure(envelope.NewProblem(http.StatusUnauthorized, CodeUnauthorized, "invalid router token")))
 				return
 			}
 		}
-		next(w, r)
-	}
+		next.ServeHTTP(w, r)
+	})
 }
 
-func (s *Server) models(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) models(context.Context, struct{}) (ModelList, error) {
 	infos := make([]ModelInfo, 0, len(s.router.Entries))
 	for _, e := range s.router.Entries {
 		c := e.Config
 		infos = append(infos, ModelInfo{c.Name, c.Protocol, c.Model, c.Tier, c.ContextTokens, c.ReasoningMode, c.RequestsPerMinute, c.Kind})
 	}
 	sort.SliceStable(infos, func(i, j int) bool { return infos[i].Tier < infos[j].Tier })
-	writeJSON(w, http.StatusOK, map[string]any{"models": infos})
+	return ModelList{Models: infos}, nil
 }
 
-func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
-	var request model.Request
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBytes)).Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, errors.New("invalid JSON request"))
-		return
-	}
+func (s *Server) chat(ctx context.Context, request model.Request) (model.Response, error) {
 	if len(request.Messages) == 0 {
-		writeError(w, http.StatusBadRequest, errors.New("messages required"))
-		return
+		return model.Response{}, envelope.NewProblem(http.StatusBadRequest, CodeMessagesRequired, "messages required")
 	}
-	ctx, cancel := context.WithTimeout(agentlog.WithRecorder(r.Context(), s.options.Recorder), s.options.RequestTimeout)
-	defer cancel()
 	response, err := s.router.Chat(ctx, request)
-	if err != nil {
-		writeError(w, chatStatus(ctx, err), err)
-		return
-	}
-	writeJSON(w, http.StatusOK, response)
+	return response, routerProblem(ctx, err)
 }
 
-func (s *Server) embeddings(w http.ResponseWriter, r *http.Request) {
-	var request model.EmbeddingRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBytes)).Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, errors.New("invalid JSON request"))
-		return
-	}
+func (s *Server) embeddings(ctx context.Context, request model.EmbeddingRequest) (model.EmbeddingResponse, error) {
 	if len(request.Input) == 0 {
-		writeError(w, http.StatusBadRequest, errors.New("input required"))
-		return
+		return model.EmbeddingResponse{}, envelope.NewProblem(http.StatusBadRequest, CodeInputRequired, "input required")
 	}
-	ctx, cancel := context.WithTimeout(agentlog.WithRecorder(r.Context(), s.options.Recorder), s.options.RequestTimeout)
-	defer cancel()
 	response, err := s.router.Embed(ctx, request)
-	if err != nil {
-		writeError(w, chatStatus(ctx, err), err)
-		return
-	}
-	writeJSON(w, http.StatusOK, response)
+	return response, routerProblem(ctx, err)
 }
 
-// chatStatus reads the request deadline directly: a provider's own transport
+// routerProblem reads the request deadline directly: a provider's own transport
 // timeout also matches context.DeadlineExceeded but is an upstream failure.
-func chatStatus(ctx context.Context, err error) int {
+func routerProblem(ctx context.Context, err error) error {
 	switch {
+	case err == nil:
+		return nil
 	case errors.Is(err, model.ErrUnknownModel):
-		return http.StatusNotFound
+		return envelope.NewProblem(http.StatusNotFound, CodeModelUnknown, err.Error()).Wrap(err)
 	case errors.Is(err, model.ErrNoEligibleModel):
-		return http.StatusUnprocessableEntity
+		return envelope.NewProblem(http.StatusUnprocessableEntity, CodeNoEligibleModel, err.Error()).Wrap(err)
 	case ctx.Err() != nil:
-		return http.StatusGatewayTimeout
+		return envelope.NewProblem(http.StatusGatewayTimeout, envelope.CodeTimeout, err.Error()).Wrap(err)
 	}
-	return http.StatusBadGateway
-}
-
-func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
-}
-
-func writeError(w http.ResponseWriter, status int, err error) {
-	writeJSON(w, status, map[string]string{"error": err.Error()})
+	return envelope.NewProblem(http.StatusBadGateway, CodeUpstreamFailed, err.Error()).Wrap(err)
 }
 
 // RequireToken refuses to expose provider credentials beyond loopback without
