@@ -69,7 +69,10 @@ func (o Server) problem(err error) *Problem {
 		return nil
 	}
 	var p *Problem
-	if errors.As(err, &p) && p != nil {
+	if errors.As(err, &p) {
+		if p == nil {
+			return nilProblem()
+		}
 		return p
 	}
 	if o.Map != nil {
@@ -116,7 +119,7 @@ func Handle[In, Out any](s *Server, name string, fn func(context.Context, In) (O
 		}
 		ctx, span := agentlog.Start(ctx, name, input)
 		if err := span.Err(); err != nil {
-			Write(w, Failure(NewProblem(http.StatusServiceUnavailable, CodeAuditUnavailable, err.Error())))
+			Write(w, Failure(auditProblem(err)))
 			return
 		}
 		ctx = context.WithValue(ctx, requestKey{}, r)
@@ -158,7 +161,7 @@ func Handle[In, Out any](s *Server, name string, fn func(context.Context, In) (O
 		}
 		// The completion record is written before the result is released.
 		if auditErr := span.End(record, nil, recorded); auditErr != nil {
-			env = Failure(NewProblem(http.StatusServiceUnavailable, CodeAuditUnavailable, auditErr.Error()))
+			env = Failure(auditProblem(auditErr))
 			if sw != nil {
 				env.Meta.Events, env.Meta.EventsSHA256 = sw.summary()
 			}

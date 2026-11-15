@@ -123,13 +123,32 @@ func (p *Problem) Wrap(err error) *Problem {
 }
 
 func (p *Problem) Error() string {
+	if p == nil {
+		return "nil problem"
+	}
 	if p.Detail != "" {
 		return p.Code + ": " + p.Detail
 	}
 	return p.Code + ": " + p.Title
 }
 
-func (p *Problem) Unwrap() error { return p.cause }
+func (p *Problem) Unwrap() error {
+	if p == nil {
+		return nil
+	}
+	return p.cause
+}
+
+// nilProblem replaces a nil *Problem that was returned as a non-nil error,
+// which is a bug in the caller and must not be mistaken for success.
+func nilProblem() *Problem {
+	return NewProblem(http.StatusInternalServerError, CodeInternal, "a nil *Problem was returned as an error")
+}
+
+// auditProblem reports that the audit session could not record a call.
+func auditProblem(err error) *Problem {
+	return NewProblem(http.StatusServiceUnavailable, CodeAuditUnavailable, err.Error()).Wrap(err)
+}
 
 func retryableStatus(status int) bool {
 	switch status {
@@ -146,7 +165,10 @@ func AsProblem(err error) *Problem {
 		return nil
 	}
 	var p *Problem
-	if errors.As(err, &p) && p != nil {
+	if errors.As(err, &p) {
+		if p == nil {
+			return nilProblem()
+		}
 		return p
 	}
 	var tooLarge *http.MaxBytesError
@@ -154,7 +176,7 @@ func AsProblem(err error) *Problem {
 	case errors.As(err, &tooLarge):
 		return NewProblem(http.StatusRequestEntityTooLarge, CodeBodyTooLarge, fmt.Sprintf("request body exceeds %d bytes", tooLarge.Limit)).Wrap(err)
 	case errors.Is(err, agentlog.ErrClosed):
-		return NewProblem(http.StatusServiceUnavailable, CodeAuditUnavailable, err.Error()).Wrap(err)
+		return auditProblem(err)
 	case errors.Is(err, context.DeadlineExceeded):
 		return NewProblem(http.StatusGatewayTimeout, CodeTimeout, err.Error()).Wrap(err)
 	case errors.Is(err, context.Canceled):

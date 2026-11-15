@@ -74,6 +74,9 @@ func newFixture(t *testing.T) *fixture {
 			panic("intentional-handler-panic")
 		case "deadline":
 			return answer{}, context.DeadlineExceeded
+		case "typed-nil":
+			var p *envelope.Problem
+			return answer{}, p // a classic mistake: a nil pointer in a non-nil error
 		}
 		return answer{}, errors.New("unexpected failure")
 	}))
@@ -176,9 +179,13 @@ func TestEveryFailureIsAProblem(t *testing.T) {
 		{"panic", envelope.CodeInternalPanic, http.StatusInternalServerError},
 		{"deadline", envelope.CodeTimeout, http.StatusGatewayTimeout},
 		{"other", envelope.CodeInternal, http.StatusInternalServerError},
+		{"typed-nil", envelope.CodeInternal, http.StatusInternalServerError},
 	}
 	for _, c := range cases {
 		_, meta, err := envelope.Call[answer](f.ctx, f.client, "POST", "/fail", question{Text: c.text})
+		if _, bare := err.(*envelope.Problem); !bare {
+			t.Errorf("%s: Call must return the Problem itself, got %T", c.text, err)
+		}
 		p := problemOf(t, err)
 		if p.Code != c.code || p.Status != c.status {
 			t.Errorf("%s: got %s/%d, want %s/%d", c.text, p.Code, p.Status, c.code, c.status)
@@ -398,6 +405,19 @@ func TestBrokenStreamsAreFailures(t *testing.T) {
 		}
 		if path == "/legacy" && !strings.Contains(p.Detail, "unknown model") {
 			t.Errorf("legacy error text lost: %q", p.Detail)
+		}
+	}
+	// An oversized plain reply is rejected, not cut to a prefix that may parse.
+	small := &envelope.Client{BaseURL: ts.URL, MaxBodyBytes: 8}
+	for _, err := range []error{
+		func() error { _, _, e := envelope.Call[answer](ctx, small, "POST", "/bare", nil); return e }(),
+		func() error {
+			_, _, e := envelope.Collect[answer](envelope.Stream(ctx, small, "POST", "/bare", nil), nil)
+			return e
+		}(),
+	} {
+		if p := problemOf(t, err); p.Code != envelope.CodeBadEnvelope || !strings.Contains(p.Detail, "exceeds 8 bytes") {
+			t.Errorf("oversized reply: %+v", p)
 		}
 	}
 	// No listener at all is still a Problem.

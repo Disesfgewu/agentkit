@@ -12,6 +12,7 @@ import (
 	"iter"
 	"mime"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 
@@ -43,7 +44,7 @@ func (c *Client) http() *http.Client {
 	return http.DefaultClient
 }
 
-func (c *Client) request(ctx context.Context, method, path, accept string, in any, parent agentlog.Receipt) (*http.Request, error) {
+func (c *Client) request(ctx context.Context, method, path, accept string, in any, parent agentlog.Receipt) (*http.Request, *Problem) {
 	var body io.Reader
 	if in != nil {
 		raw, err := json.Marshal(in)
@@ -113,45 +114,76 @@ func auditOutput(status int, env Envelope) map[string]any {
 	return out
 }
 
+// endOnPanic closes an audit call that a panic would otherwise leave open,
+// which would make Recorder.Close wait forever. Defer it directly.
+func endOnPanic(span *agentlog.Span, output func() any) {
+	if p := recover(); p != nil {
+		_ = span.End(output(), nil, fmt.Errorf("panic: %v\n%s", p, debug.Stack()))
+		panic(p)
+	}
+}
+
 // Call sends one request and unwraps the reply. The error is nil or a
-// *Problem (possibly joined with an audit failure), whatever went wrong:
-// refused connection, timeout, malformed reply, or a failure the server
-// reported. The call is recorded in the audit session carried by ctx, with a
-// reference to the server's own audit record.
-func Call[Out any](ctx context.Context, c *Client, method, path string, in any) (out Out, meta Meta, err error) {
+// *Problem, whatever went wrong: refused connection, timeout, malformed reply,
+// a failure the server reported, or an audit session that could not record
+// the call. The call is recorded in the audit session carried by ctx, with a
+// reference to the server's own audit record, before the result is returned.
+func Call[Out any](ctx context.Context, c *Client, method, path string, in any) (Out, Meta, error) {
+	var out Out
 	status, env := 0, Envelope{}
+	output := func() any { return auditOutput(status, env) }
 	ctx, span := agentlog.Start(ctx, "envelope.Call", map[string]any{"method": method, "url": strings.TrimRight(c.BaseURL, "/") + path, "body": in})
-	defer span.Finish(&err, func() any { return auditOutput(status, env) }, nil)
-	if err = span.Err(); err != nil {
-		return out, meta, AsProblem(err)
+	if startErr := span.Err(); startErr != nil {
+		return out, Meta{}, auditProblem(startErr)
 	}
-	req, err := c.request(ctx, method, path, "application/json", in, span.Receipt())
-	if err != nil {
-		return out, meta, err
+	defer endOnPanic(span, output)
+	problem := func() *Problem {
+		req, p := c.request(ctx, method, path, "application/json", in, span.Receipt())
+		if p != nil {
+			return p
+		}
+		resp, err := c.http().Do(req)
+		if err != nil {
+			return transportProblem(ctx, err)
+		}
+		defer resp.Body.Close()
+		status = resp.StatusCode
+		raw, p := readBody(ctx, resp.Body, c.MaxBodyBytes)
+		if p != nil {
+			return p
+		}
+		if env, p = parseEnvelope(status, raw); p != nil {
+			return p
+		}
+		if out, err = Decode[Out](env); err != nil {
+			return AsProblem(err)
+		}
+		return nil
+	}()
+	var failure error
+	if problem != nil {
+		failure = problem
 	}
-	resp, doErr := c.http().Do(req)
-	if doErr != nil {
-		return out, meta, transportProblem(ctx, doErr)
+	if auditErr := span.End(output(), nil, failure); auditErr != nil {
+		var zero Out
+		return zero, env.Meta, auditProblem(auditErr)
 	}
-	defer resp.Body.Close()
-	status = resp.StatusCode
-	limit := c.MaxBodyBytes
+	return out, env.Meta, failure
+}
+
+// readBody reads a non-streamed reply and rejects one larger than limit.
+func readBody(ctx context.Context, body io.Reader, limit int64) ([]byte, *Problem) {
 	if limit <= 0 {
 		limit = defaultMaxBodyBytes
 	}
-	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-	if readErr != nil {
-		return out, meta, transportProblem(ctx, readErr)
+	raw, err := io.ReadAll(io.LimitReader(body, limit+1))
+	if err != nil {
+		return nil, transportProblem(ctx, err)
 	}
 	if int64(len(raw)) > limit {
-		return out, meta, NewProblem(http.StatusBadGateway, CodeBadEnvelope, fmt.Sprintf("response exceeds %d bytes", limit))
+		return nil, NewProblem(http.StatusBadGateway, CodeBadEnvelope, fmt.Sprintf("response exceeds %d bytes", limit))
 	}
-	var problem *Problem
-	if env, problem = parseEnvelope(status, raw); problem != nil {
-		return out, env.Meta, problem
-	}
-	out, err = Decode[Out](env)
-	return out, env.Meta, err
+	return raw, nil
 }
 
 // Stream sends one request and yields the events the server publishes,
@@ -166,7 +198,6 @@ func Call[Out any](ctx context.Context, c *Client, method, path string, in any) 
 // result. With iter.Pull2, always call stop.
 func Stream(ctx context.Context, c *Client, method, path string, in any) iter.Seq2[Event, error] {
 	return func(yield func(Event, error) bool) {
-		var err error
 		status, env, events, terminal := 0, Envelope{}, uint64(0), "none"
 		digest := sha256.New()
 		output := func() any {
@@ -180,14 +211,30 @@ func Stream(ctx context.Context, c *Client, method, path string, in any) iter.Se
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		ctx, span := agentlog.Start(ctx, "envelope.Stream", map[string]any{"method": method, "url": strings.TrimRight(c.BaseURL, "/") + path, "body": in})
-		defer span.Finish(&err, output, nil)
-		fail := func(p error) {
-			err, terminal = p, "failed"
-			yield(Event{Type: EventResult, Seq: events + 1, Meta: &env.Meta}, p)
-		}
 		if startErr := span.Err(); startErr != nil {
-			fail(AsProblem(startErr))
+			yield(Event{Type: EventResult, Seq: 1, Meta: &env.Meta}, auditProblem(startErr))
 			return
+		}
+		// The call is still open here only if the caller left the loop or
+		// panicked inside it; every other path has already recorded its outcome.
+		defer func() {
+			p := recover()
+			var failure error
+			if p != nil {
+				failure = fmt.Errorf("panic: %v\n%s", p, debug.Stack())
+			}
+			_ = span.End(output(), nil, failure)
+			if p != nil {
+				panic(p)
+			}
+		}()
+		// fail records the failure before reporting it.
+		fail := func(p *Problem) {
+			terminal = "failed"
+			if auditErr := span.End(output(), nil, p); auditErr != nil {
+				p = auditProblem(auditErr)
+			}
+			yield(Event{Type: EventResult, Seq: events + 1, Meta: &env.Meta}, p)
 		}
 		req, reqErr := c.request(ctx, method, path, "text/event-stream, application/json", in, span.Receipt())
 		if reqErr != nil {
@@ -214,23 +261,19 @@ func Stream(ctx context.Context, c *Client, method, path string, in any) iter.Se
 			}
 			terminal = "completed"
 			if auditErr := span.End(output(), nil, nil); auditErr != nil {
-				fail(AsProblem(auditErr))
+				terminal = "failed"
+				yield(Event{Type: EventResult, Seq: events + 1, Meta: &env.Meta}, auditProblem(auditErr))
 				return
 			}
 			yield(Event{Type: EventResult, Seq: events + 1, Time: env.Meta.Time, Data: env.Data, Meta: &env.Meta}, nil)
 		}
 
 		if mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mediaType != "text/event-stream" {
-			limit := c.MaxBodyBytes
-			if limit <= 0 {
-				limit = defaultMaxBodyBytes
-			}
-			raw, readErr := io.ReadAll(io.LimitReader(resp.Body, limit))
-			if readErr != nil {
-				fail(transportProblem(ctx, readErr))
+			raw, problem := readBody(ctx, resp.Body, c.MaxBodyBytes)
+			if problem != nil {
+				fail(problem)
 				return
 			}
-			var problem *Problem
 			if env, problem = parseEnvelope(status, raw); problem != nil {
 				fail(problem)
 				return
@@ -264,7 +307,7 @@ func Stream(ctx context.Context, c *Client, method, path string, in any) iter.Se
 			eventName := name
 			name, data = "", nil
 			if payload == "" {
-				continue
+				continue // the SSE rules do not dispatch an event without data
 			}
 			if eventName == EventResult {
 				if decodeErr := json.Unmarshal([]byte(payload), &env); decodeErr != nil || env.Version == "" {
