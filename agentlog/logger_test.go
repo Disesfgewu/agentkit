@@ -2,6 +2,7 @@ package agentlog
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -114,5 +115,40 @@ func TestEffectiveTimeIsWrittenAndVerified(t *testing.T) {
 	}
 	if _, err := Verify(path); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReceiptNamesTheCompletionRecord(t *testing.T) {
+	r, e := New("receipt", t.TempDir())
+	if e != nil {
+		t.Fatal(e)
+	}
+	ctx := WithRecorder(context.Background(), r)
+	_, first := Start(ctx, "first", nil)
+	_, second := Start(ctx, "second", nil)
+	if got := second.Receipt(); got.Session != r.SessionID || got.CallID != 2 || got.Seq != 0 || got.Hash != "" {
+		t.Fatalf("receipt before End: %+v", got)
+	}
+	// Completion order, not start order, decides the position in the chain.
+	if e = second.End("b", nil, nil); e != nil {
+		t.Fatal(e)
+	}
+	if e = first.End("a", nil, nil); e != nil {
+		t.Fatal(e)
+	}
+	if e = r.Close(); e != nil {
+		t.Fatal(e)
+	}
+	b, _ := os.ReadFile(r.Path)
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	for i, span := range []*Span{second, first} {
+		got := span.Receipt()
+		if got.Seq != uint64(i+1) || !strings.HasSuffix(lines[i], ", hash:"+got.Hash) || !strings.Contains(lines[i], fmt.Sprintf(", call_id:%d,", got.CallID)) {
+			t.Fatalf("receipt %+v does not name line %d: %s", got, i, lines[i])
+		}
+	}
+	var closed *Span
+	if got := closed.Receipt(); got != (Receipt{}) {
+		t.Fatalf("nil span receipt: %+v", got)
 	}
 }

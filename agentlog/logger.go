@@ -52,7 +52,32 @@ type Span struct {
 	once             sync.Once
 	own              bool
 	startErr, endErr error
+	// seq and hash locate the completion record; set once it is written.
+	seq  uint64
+	hash string
 }
+
+// Receipt locates one call in its audit session. Seq and Hash are set only
+// after the completion record is durable, so a caller that hands a Receipt to
+// someone else can prove the result was recorded before it was released.
+type Receipt struct {
+	Session string `json:"session"`
+	CallID  uint64 `json:"call_id"`
+	Seq     uint64 `json:"seq,omitempty"`
+	Hash    string `json:"hash,omitempty"`
+}
+
+// Receipt reports where this call is recorded. Before End it holds only the
+// session and call ID; a span that failed to start returns the zero Receipt.
+func (s *Span) Receipt() Receipt {
+	if s == nil || s.recorder == nil || s.startErr != nil {
+		return Receipt{}
+	}
+	s.recorder.mu.Lock()
+	defer s.recorder.mu.Unlock()
+	return Receipt{Session: s.recorder.SessionID, CallID: s.callID, Seq: s.seq, Hash: s.hash}
+}
+
 type beginRecord struct {
 	CallID   uint64          `json:"call_id"`
 	ParentID uint64          `json:"parent_call_id"`
@@ -333,6 +358,7 @@ func (r *Recorder) writeLocked(s *Span, out any, tokens *int, opErr error) error
 	}
 	r.seq++
 	r.lastHash = hash
+	s.seq, s.hash = r.seq, hash
 	return nil
 }
 func (r *Recorder) Err() error {

@@ -13,6 +13,7 @@ This is a LangGraph-inspired Go runtime, not an official port. It implements the
 | `agent` | Independent parts (`ChatAgent`, `EmbeddingAgent`, `RAGAgent`, `ToolBox`) and `Template`, which composes them under one audit session | `graph`, `model`, `agentlog` |
 | `agentlog` | One audit session per call tree, redaction, and a verifiable SHA-256 chain | none |
 | `llmrouter` | Serves `model.Router` over HTTP | `model`, `agentlog` |
+| `envelope` | The one response format between services: typed endpoint wrapper, matching client, event stream, automatic audit on both ends | `agentlog` |
 
 Use only what you need. `graph` works without `agent` or `model`.
 
@@ -133,6 +134,43 @@ go run ./cmd/llmrouter -config models.example.json -env .env -addr 127.0.0.1:878
 - A non-loopback `-addr` requires a bearer token in `LLMROUTER_TOKEN`.
 - `-request-timeout` bounds retries and failover per request and must stay below `model.RemoteTimeout`.
 - The router writes its own hash-chained audit log. It does not yet share call IDs with the calling agent's log.
+
+## Envelope
+
+Services talk to each other in one response format, and `envelope` is the only code that writes or reads it. Success and failure have the same shape, so a caller unwraps every reply the same way:
+
+```json
+{"version":"1","ok":true,"code":"ok","message":"","data":{"text":"hello"},"error":null,
+ "meta":{"audit":{"session":"router_2026-11-16-...","call_id":7,"seq":12,"hash":"9f2c..."},"t":"2026-11-16T02:00:00Z"}}
+```
+
+On failure `ok` is false, `data` is null, and `error` is a problem object whose `type`, `title`, `status`, `detail`, and `instance` are the RFC 9457 members, plus a stable `code` to branch on, `retryable`, and optional field `errors`. The HTTP status always equals `error.status`.
+
+```go
+// Server: a typed function becomes an endpoint.
+mux.Handle("POST /v1/answer", envelope.Handle(server, "qa.Answer", func(ctx context.Context, q Question) (Answer, error) {
+    envelope.Emit(ctx, "step.finished", map[string]any{"step": "retrieve"}) // sent only to streaming clients
+    return answer(ctx, q)
+}))
+
+// Client: one call returns the typed data or a *envelope.Problem.
+out, meta, err := envelope.Call[Answer](ctx, client, "POST", "/v1/answer", Question{Text: "..."})
+
+// Or follow progress; the same endpoint serves both.
+out, meta, err := envelope.Collect[Answer](envelope.Stream(ctx, client, "POST", "/v1/answer", q), func(e envelope.Event) error {
+    return nil
+})
+```
+
+What the wrapper guarantees, so endpoint code does not have to:
+
+- **Nothing escapes the format.** A returned error, a panic, an invalid or oversized body, a timeout, a refused connection, a proxy error page, and a reply from a service that does not use the envelope all reach the caller as a `*envelope.Problem`. Use `Server.Map` to give your own errors a status and code.
+- **Audit is automatic on both ends.** Each request is one audit call on the server and one on the client. The server records the caller's session and call ID; the client records the server's receipt from `meta.audit`, so the two hash chains reference each other.
+- **Audit before work, and before release.** If the audit session cannot record the request, the function does not run. A result is sent only after its completion record is durable, and `meta.audit.hash` names that record.
+- **A stream is one audit call.** Events are not logged one by one; the completion record on each side holds the event count and a SHA-256 over them, and the client rejects a stream whose count or digest differs from what the server reports. A stream that ends without a result, or skips a sequence number, is a failure.
+- **Leaving the loop cancels.** Breaking out of `range envelope.Stream(...)` closes the connection, cancels the handler's context, and closes both audit calls. With `iter.Pull2`, always call `stop`, or `Recorder.Close` waits forever.
+
+Limits: `data` is null on failure, so partial output is kept in the audit record only. Events are sent as given, without the audit log's redaction, so do not put secrets in them. Field names containing `token`, `secret`, `password`, `credential`, or `authorization` are redacted in the audit record; name fields accordingly (for example `next_cursor`, not `next_page_token`). There is no resume after a broken stream: re-issue the request. `Client.HTTP` must not set a total `Timeout`, because it also cuts off a stream that is still delivering; bound a call with its context.
 
 ## Audit log
 
